@@ -113,6 +113,7 @@ Each check can also run without the menu:
 xvpn diagnose direct
 xvpn diagnose sites
 xvpn diagnose profiles
+xvpn diagnose profiles --yes
 xvpn diagnose profile-commands
 xvpn diagnose modes
 xvpn diagnose firefox
@@ -120,10 +121,19 @@ xvpn diagnose all
 ```
 
 The diagnostic log is written to `~/.local/state/xvpn/diagnose.log`. Network
+The profiles check first shows the observed `ifconfig.me` IP for direct mode
+and every profile, then asks for one confirmation before running automated
+checks. Use `--yes` (or `-y`) to skip that confirmation. The legacy probes
+remain `curl -4 ip.me` and `curl -4 ifconfig.me`; if a proxy returns an IPv6
+address, diagnostics additionally query an IPv4-only fallback so the result
+can be compared as IPv4.
 The profile check switches through all profiles without turning routing off
 between profiles, then performs one final `xvpn off` cleanup after the last
-profile. Other checks use only `curl -4 ip.me` and `curl -4 ifconfig.me`. The Firefox check
-opens `https://ifconfig.me` for a manual check and does not use curl.
+profile. When running a manual check through a profile, the original
+bare-host behavior is preserved, so `xvpn 2 curl -4 ifconfig.me` may expose
+the proxy's actual IPv6 egress while the diagnostic fallback reports an IPv4
+comparison value. The Firefox check opens `https://ifconfig.me` for a manual
+check and does not use curl.
 
 ## Privilege behavior
 

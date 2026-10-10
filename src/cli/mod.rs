@@ -7,6 +7,10 @@ use crate::{utils, vpn};
 #[derive(Parser)]
 #[command(name = "xvpn", version, about = "xray VPN manager")]
 pub struct Cli {
+    /// Show xvpn status messages while running an isolated command
+    #[arg(short = 'v', long, global = true)]
+    pub verbose: bool,
+
     /// Index into the profile list (0 = off, 1 = first profile, etc.)
     #[arg(value_parser, default_value_t = 0)]
     pub index: u16,
@@ -85,6 +89,9 @@ pub enum Command {
     Diagnose {
         /// Named test to run without the interactive menu (`all` runs all tests)
         test: Option<String>,
+        /// Skip the profile preflight confirmation
+        #[arg(short = 'y', long)]
+        yes: bool,
     },
 
     /// Manage the supervisor agent
@@ -194,7 +201,7 @@ pub fn dispatch(cli: Cli) {
     let result = match cli.command {
         None => {
             if !cli.cmd.is_empty() {
-                handlers::run_app(&root, cli.index, &cli.cmd)
+                handlers::run_app(&root, cli.index, &cli.cmd, cli.verbose)
             } else if cli.index > 0 {
                 handlers::use_profile(&root, cli.index)
             } else {
@@ -221,7 +228,7 @@ pub fn dispatch(cli: Cli) {
         Some(Command::Logs) => handlers::logs(),
         Some(Command::Repair) => handlers::repair(&root),
         Some(Command::Reset) => handlers::reset(&root),
-        Some(Command::Diagnose { test }) => handlers::diagnose(&root, test.as_deref()),
+        Some(Command::Diagnose { test, yes }) => handlers::diagnose(&root, test.as_deref(), yes),
         Some(Command::Agent { cmd }) => {
             let cmd = cmd.unwrap_or(AgentCmd::Install);
             handlers::agent(cmd, &root)

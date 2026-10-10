@@ -1,6 +1,6 @@
 use std::fs;
 use std::io::{self, Write};
-use std::net::TcpStream;
+use std::net::{IpAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -360,6 +360,10 @@ pub fn use_network(root: &Path, add: bool, dns: Option<&str>) -> Result<()> {
 }
 
 const PROBES: [(&str, u16); 2] = [("socks5", config::SOCKS_PORT), ("http", config::HTTP_PORT)];
+const IP_CHECK_HOST: &str = "ip.me";
+const IFCONFIG_CHECK_HOST: &str = "ifconfig.me";
+const IPV4_FALLBACK_IP_URL: &str = "https://api4.ipify.org";
+const IPV4_FALLBACK_IFCONFIG_URL: &str = "https://ipv4.icanhazip.com";
 
 pub fn check_vpn(root: &Path) -> Result<()> {
     let (name, _) = profile::resolve_active(root)?;
@@ -380,7 +384,16 @@ pub fn check_vpn(root: &Path) -> Result<()> {
 
 fn run_curl(proxy: &str) -> Result<String> {
     let out = Command::new("curl")
-        .args(["-s", "-x", proxy, "ifconfig.me"])
+        .args([
+            "-4",
+            "--retry",
+            "3",
+            "--retry-all-errors",
+            "-s",
+            "-x",
+            proxy,
+            IFCONFIG_CHECK_HOST,
+        ])
         .stdin(Stdio::null())
         .output()
         .map_err(|e| format!("curl failed: {e}"))?;
@@ -534,7 +547,7 @@ const DIAGNOSTIC_TESTS: [(&str, &str, &str, bool); 6] = [
     ),
 ];
 
-const DIAGNOSTIC_LABEL_WIDTH: usize = 24;
+const DIAGNOSTIC_LABEL_WIDTH: usize = 30;
 const DIAGNOSTIC_DISPLAY_WIDTH: usize = 78;
 
 struct Spinner {
@@ -617,7 +630,7 @@ impl DiagnosticLog {
     }
 }
 
-pub fn diagnose(root: &Path, test: Option<&str>) -> Result<()> {
+pub fn diagnose(root: &Path, test: Option<&str>, yes: bool) -> Result<()> {
     let selected = match test {
         Some("all") => (0..DIAGNOSTIC_TESTS.len()).collect(),
         Some(name) => vec![diagnostic_index(name)?],
@@ -638,6 +651,12 @@ pub fn diagnose(root: &Path, test: Option<&str>) -> Result<()> {
 
     let log = DiagnosticLog::new()?;
     log.write(&format!("BEGIN selected={selected:?}"))?;
+    if selected
+        .iter()
+        .any(|index| DIAGNOSTIC_TESTS[*index].0 == "profiles")
+    {
+        diagnostic_profile_preflight(root, &log, yes)?;
+    }
     let mut failures = Vec::new();
 
     for index in selected {
@@ -732,11 +751,11 @@ fn diagnostic_sites(root: &Path, log: &DiagnosticLog) -> Result<()> {
     let path = root.join(config::DEFAULT);
     let had_site = network::listed_sites(&path)?
         .iter()
-        .any(|site| site == "ip.me");
+        .any(|site| site == IP_CHECK_HOST);
     let mut added = false;
     let result = (|| {
-        log.write("COMMAND xvpn sites set ip.me")?;
-        add_site(root, "ip.me")?;
+        log.write(&format!("COMMAND xvpn sites set {IP_CHECK_HOST}"))?;
+        add_site(root, IP_CHECK_HOST)?;
         added = true;
         log.write("COMMAND xvpn default")?;
         set_mode(root, Mode::Default)?;
@@ -748,8 +767,12 @@ fn diagnostic_sites(root: &Path, log: &DiagnosticLog) -> Result<()> {
     })();
     let mut cleanup_errors = Vec::new();
     if added && !had_site {
-        cleanup_log(log, "COMMAND xvpn sites remove ip.me", &mut cleanup_errors);
-        if let Err(error) = remove_site(root, "ip.me") {
+        cleanup_log(
+            log,
+            &format!("COMMAND xvpn sites remove {IP_CHECK_HOST}"),
+            &mut cleanup_errors,
+        );
+        if let Err(error) = remove_site(root, IP_CHECK_HOST) {
             cleanup_errors.push(error);
         }
     }
@@ -779,8 +802,10 @@ fn cleanup_log(log: &DiagnosticLog, message: &str, errors: &mut Vec<String>) {
 fn diagnostic_profiles(root: &Path, log: &DiagnosticLog) -> Result<()> {
     log.write("COMMAND xvpn off")?;
     set_mode(root, Mode::Off)?;
-    log.write("COMMAND curl -4 -sS ip.me (direct baseline)")?;
-    let direct_ip = diagnose_curl(log, "ip.me")?;
+    log.write(&format!(
+        "COMMAND curl -4 -sS {IP_CHECK_HOST} (direct baseline)"
+    ))?;
+    let direct_ip = diagnose_curl(log, IP_CHECK_HOST)?;
     log.write(&format!("DIRECT IP {direct_ip}"))?;
 
     let count = profile::list(root).len();
@@ -792,8 +817,10 @@ fn diagnostic_profiles(root: &Path, log: &DiagnosticLog) -> Result<()> {
             failures.push(format!("profile {index}: {error}"));
             continue;
         }
-        log.write(&format!("COMMAND curl -4 -sS ip.me (profile {index})"))?;
-        match diagnose_curl(log, "ip.me") {
+        log.write(&format!(
+            "COMMAND curl -4 -sS {IP_CHECK_HOST} (profile {index})"
+        ))?;
+        match diagnose_profile_curl(log, &direct_ip, index) {
             Ok(ip) if ip == direct_ip => {
                 failures.push(format!(
                     "profile {index}: returned direct IP {ip}, traffic is not using this profile"
@@ -821,6 +848,129 @@ fn diagnostic_profiles(root: &Path, log: &DiagnosticLog) -> Result<()> {
     }
 }
 
+fn diagnostic_profile_preflight(root: &Path, log: &DiagnosticLog, yes: bool) -> Result<()> {
+    println!("\nPROFILE PREFLIGHT");
+    println!("Run curl through each profile before automated checks.");
+    println!();
+
+    let count = profile::list(root).len();
+    let executable = std::env::current_exe().map_err(|e| format!("xvpn path: {e}"))?;
+    let mut results = Vec::new();
+    for index in 0..=count {
+        let label = if index == 0 {
+            "direct".to_string()
+        } else {
+            format!("profile {index}")
+        };
+        log.write(&format!(
+            "PREFLIGHT xvpn {index} curl -4 --retry 3 {IFCONFIG_CHECK_HOST}"
+        ))?;
+        let output = Command::new(&executable)
+            .args([
+                index.to_string(),
+                "curl".into(),
+                "-4".into(),
+                "--retry".into(),
+                "3".into(),
+                "--retry-all-errors".into(),
+                IFCONFIG_CHECK_HOST.into(),
+            ])
+            .output()
+            .map_err(|e| format!("preflight {label}: {e}"))?;
+        let text = compact_diagnostic_output(&String::from_utf8_lossy(&output.stdout));
+        let mut ip = extract_ip(&text).unwrap_or("unavailable").to_string();
+        if output.status.success() && ip.parse::<std::net::Ipv6Addr>().is_ok() {
+            log.write(&format!(
+                "PREFLIGHT IPv6 {label} primary={ip}; requesting IPv4 fallback"
+            ))?;
+            let fallback = ipv4_fallback_url(IFCONFIG_CHECK_HOST);
+            log.write(&format!(
+                "PREFLIGHT xvpn {index} curl -4 --retry 3 {fallback} (IPv4 fallback)"
+            ))?;
+            let fallback_output = Command::new(&executable)
+                .args([
+                    index.to_string(),
+                    "curl".into(),
+                    "-4".into(),
+                    "--retry".into(),
+                    "3".into(),
+                    "--retry-all-errors".into(),
+                    fallback.into(),
+                ])
+                .output()
+                .map_err(|e| format!("preflight {label} fallback: {e}"))?;
+            let fallback_text =
+                compact_diagnostic_output(&String::from_utf8_lossy(&fallback_output.stdout));
+            match extract_ip(&fallback_text)
+                .and_then(|value| value.parse::<std::net::Ipv4Addr>().ok())
+            {
+                Some(fallback_ip) if fallback_output.status.success() => {
+                    ip = fallback_ip.to_string();
+                }
+                _ => {
+                    let stderr = compact_diagnostic_output(&String::from_utf8_lossy(
+                        &fallback_output.stderr,
+                    ));
+                    log.write(&format!(
+                        "PREFLIGHT FALLBACK FAILURE {label} status={} stderr={stderr:?}",
+                        fallback_output.status
+                    ))?;
+                    ip = "unavailable".to_string();
+                }
+            }
+        }
+        log.write(&format!("PREFLIGHT RESULT {label} ip={ip}"))?;
+        if !output.status.success() {
+            log.write(&format!("PREFLIGHT FAILURE {label} command failed"))?;
+            let stderr = compact_diagnostic_output(&String::from_utf8_lossy(&output.stderr));
+            if !stderr.is_empty() {
+                log.write(&format!("PREFLIGHT STDERR {label} {stderr}"))?;
+            }
+        }
+        results.push((label, ip));
+    }
+    for (label, ip) in &results {
+        println!("  {:<12} {}", label, ip);
+    }
+    if yes {
+        println!("  Continuing automatically (--yes).\n");
+        return Ok(());
+    }
+    print!("\nAre these IPs correct? [Y/n] ");
+    io::stdout()
+        .flush()
+        .map_err(|e| format!("flushing preflight prompt: {e}"))?;
+    let mut answer = String::new();
+    io::stdin()
+        .read_line(&mut answer)
+        .map_err(|e| format!("reading preflight confirmation: {e}"))?;
+    if matches!(answer.trim().to_ascii_lowercase().as_str(), "n" | "no") {
+        return Err("diagnostic cancelled during profile preflight".into());
+    }
+    println!();
+    Ok(())
+}
+
+fn extract_ip(output: &str) -> Option<&str> {
+    output
+        .split_whitespace()
+        .find(|value| value.parse::<IpAddr>().is_ok())
+}
+
+fn diagnose_profile_curl(log: &DiagnosticLog, direct_ip: &str, index: usize) -> Result<String> {
+    for attempt in 0..5 {
+        let ip = diagnose_curl(log, IP_CHECK_HOST)?;
+        if ip != direct_ip || attempt == 4 {
+            return Ok(ip);
+        }
+        std::thread::sleep(Duration::from_secs(1));
+        log.write(&format!(
+            "RETRY profile {index}: still using direct IP {direct_ip}"
+        ))?;
+    }
+    unreachable!()
+}
+
 fn diagnostic_profile_commands(root: &Path, log: &DiagnosticLog) -> Result<()> {
     let count = profile::list(root).len();
     let mut failures = Vec::new();
@@ -830,12 +980,13 @@ fn diagnostic_profile_commands(root: &Path, log: &DiagnosticLog) -> Result<()> {
             failures.push(format!("profile {index} start: {error}"));
             continue;
         }
-        for host in ["ip.me", "ifconfig.me"] {
+        for host in [IP_CHECK_HOST, IFCONFIG_CHECK_HOST] {
             log.write(&format!("COMMAND xvpn {index} curl -4 {host}"))?;
             if let Err(error) = run_app(
                 root,
                 index as u16,
                 &[String::from("curl"), String::from("-4"), host.into()],
+                false,
             ) {
                 failures.push(format!("profile {index} {host}: {error}"));
             }
@@ -913,16 +1064,16 @@ fn diagnostic_firefox(root: &Path, log: &DiagnosticLog) -> Result<()> {
 }
 
 fn check_curls(log: &DiagnosticLog) -> Result<(String, String)> {
-    let ip_me = diagnose_curl(log, "ip.me")?;
-    let ifconfig = diagnose_curl(log, "ifconfig.me")?;
-    Ok((ip_me, ifconfig))
+    let ip = diagnose_curl(log, IP_CHECK_HOST)?;
+    let site_ip = diagnose_curl(log, IFCONFIG_CHECK_HOST)?;
+    Ok((ip, site_ip))
 }
 
 fn diagnose_curl(log: &DiagnosticLog, host: &str) -> Result<String> {
-    let command = format!("curl -4 -sS {host}");
+    let command = format!("curl -4 --retry 3 --retry-all-errors -sS {host}");
     log.write(&format!("COMMAND {command}"))?;
     let output = Command::new("curl")
-        .args(["-4", "-sS", host])
+        .args(["-4", "--retry", "3", "--retry-all-errors", "-sS", host])
         .output()
         .map_err(|e| format!("{command}: {e}"))?;
     let stdout = compact_diagnostic_output(&String::from_utf8_lossy(&output.stdout));
@@ -943,7 +1094,47 @@ fn diagnose_curl(log: &DiagnosticLog, host: &str) -> Result<String> {
     if stdout.is_empty() {
         return Err(format!("{command} returned no IP"));
     }
-    Ok(stdout)
+    match extract_ip(&stdout) {
+        Some(value) if value.parse::<std::net::Ipv4Addr>().is_ok() => Ok(value.to_string()),
+        Some(value) if value.parse::<std::net::Ipv6Addr>().is_ok() => {
+            log.write(&format!(
+                "FALLBACK IPv6 primary={value} host={host} using IPv4 endpoint"
+            ))?;
+            fallback_ipv4(log, host)
+        }
+        _ => Err(format!("{command} returned no IP")),
+    }
+}
+
+fn fallback_ipv4(log: &DiagnosticLog, host: &str) -> Result<String> {
+    let fallback = ipv4_fallback_url(host);
+    let command = format!("curl -4 --retry 3 --retry-all-errors -sS {fallback}");
+    log.write(&format!("COMMAND {command} (IPv4 fallback for {host})"))?;
+    let output = Command::new("curl")
+        .args(["-4", "--retry", "3", "--retry-all-errors", "-sS", fallback])
+        .output()
+        .map_err(|e| format!("{command}: {e}"))?;
+    let stdout = compact_diagnostic_output(&String::from_utf8_lossy(&output.stdout));
+    let stderr = compact_diagnostic_output(&String::from_utf8_lossy(&output.stderr));
+    log.write(&format!(
+        "OUTPUT command={command:?} status={} stdout={stdout:?} stderr={stderr:?}",
+        output.status
+    ))?;
+    if !output.status.success() {
+        return Err(format!("{command} failed"));
+    }
+    match extract_ip(&stdout).and_then(|value| value.parse::<std::net::Ipv4Addr>().ok()) {
+        Some(value) => Ok(value.to_string()),
+        None => Err(format!("{command} returned no IPv4 address")),
+    }
+}
+
+fn ipv4_fallback_url(host: &str) -> &'static str {
+    if host == IFCONFIG_CHECK_HOST {
+        IPV4_FALLBACK_IFCONFIG_URL
+    } else {
+        IPV4_FALLBACK_IP_URL
+    }
 }
 
 fn compact_diagnostic_output(value: &str) -> String {
@@ -1012,6 +1203,23 @@ mod diagnose_tests {
         let displayed = truncate_diagnostic_display(&long);
         assert_eq!(displayed.chars().count(), DIAGNOSTIC_DISPLAY_WIDTH - 1);
         assert!(displayed.ends_with('…'));
+    }
+
+    #[test]
+    fn preflight_accepts_ipv6_results_from_a_successful_proxy_command() {
+        assert_eq!(
+            extract_ip("2a09:bac5:4046:1e0a::2fe:a3"),
+            Some("2a09:bac5:4046:1e0a::2fe:a3")
+        );
+    }
+
+    #[test]
+    fn legacy_probe_fallbacks_preserve_their_endpoint_identity() {
+        assert_eq!(ipv4_fallback_url(IP_CHECK_HOST), IPV4_FALLBACK_IP_URL);
+        assert_eq!(
+            ipv4_fallback_url(IFCONFIG_CHECK_HOST),
+            IPV4_FALLBACK_IFCONFIG_URL
+        );
     }
 }
 
@@ -1088,7 +1296,7 @@ pub fn reset(root: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn run_app(root: &Path, index: u16, trailing: &[String]) -> Result<()> {
+pub fn run_app(root: &Path, index: u16, trailing: &[String], verbose: bool) -> Result<()> {
     if trailing.is_empty() {
         return Err(
             "usage: xvpn <n> <app> [args...]\n  n=0 runs without proxy, n>0 runs through that profile temporarily"
@@ -1135,13 +1343,15 @@ pub fn run_app(root: &Path, index: u16, trailing: &[String]) -> Result<()> {
     let tmp_path = tmp_dir.join(format!("xray-isolated-{}.json", tmp_id));
     config::write_json(&tmp_path, &cfg)?;
 
-    if index > 0 {
-        out::status("✓", &format!("active profile: {name}"));
+    if verbose {
+        if index > 0 {
+            out::status("✓", &format!("active profile: {name}"));
+        }
+        out::status(
+            "→",
+            &format!("starting isolated proxy on ports {socks_port}/{http_port}"),
+        );
     }
-    out::status(
-        "→",
-        &format!("starting isolated proxy on ports {socks_port}/{http_port}"),
-    );
 
     let log_path = tmp_dir.join(format!("xray-isolated-{}.log", tmp_id));
     let log_file = fs::File::create(&log_path).map_err(|e| format!("creating log: {e}"))?;
@@ -1177,17 +1387,19 @@ pub fn run_app(root: &Path, index: u16, trailing: &[String]) -> Result<()> {
         return Err("timed out waiting for isolated xray to start".into());
     }
 
-    out::status(
-        "→",
-        &format!(
-            "running {app} via {}",
-            if index == 0 {
-                "direct bypass".to_string()
-            } else {
-                format!("profile {index}")
-            }
-        ),
-    );
+    if verbose {
+        out::status(
+            "→",
+            &format!(
+                "running {app} via {}",
+                if index == 0 {
+                    "direct bypass".to_string()
+                } else {
+                    format!("profile {index}")
+                }
+            ),
+        );
+    }
 
     let mut cmd = Command::new(app);
     cmd.args(app_args);
