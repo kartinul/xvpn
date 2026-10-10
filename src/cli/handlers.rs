@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use dialoguer::MultiSelect;
+
 use crate::cli::{AppsAction, Mode, ProfileCmd, SitesAction};
 use crate::platform::network;
 use crate::utils::output as out;
@@ -30,27 +32,29 @@ pub fn use_profile(root: &Path, index: u16) -> Result<()> {
                 profiles.len()
             )
         })?;
+    let target_mode = mode_after_profile_selection(&mode);
+    if target_mode.as_str() == mode {
+        supervisor::authorize_profile_transition(root, target_mode.as_str())?;
+    }
     profile::activate(root, &name)?;
     out::status("✓", &format!("active profile: {name}"));
-
-    let target_mode = if mode == "off" {
-        Mode::Default
-    } else {
-        match mode.as_str() {
-            "on" => Mode::On,
-            "default" => Mode::Default,
-            _ => Mode::Default,
-        }
-    };
 
     if target_mode.as_str() != mode {
         set_mode(root, target_mode)?;
     } else {
-        out::kv("mode", &mode);
         refresh_sidecars(root)?;
-        out::status("→", "supervisor will reload");
+        set_mode(root, target_mode)?;
     }
+
     Ok(())
+}
+
+pub(crate) fn mode_after_profile_selection(mode: &str) -> Mode {
+    match mode {
+        "off" | "on" => Mode::On,
+        "default" => Mode::Default,
+        _ => Mode::Default,
+    }
 }
 
 pub fn run(result: Result<()>) {
@@ -127,14 +131,6 @@ fn print_routing(root: &Path) {
     let apps = network::app_names(&cfg);
     let sites = network::site_names(&cfg);
 
-    out::section("always proxied (built in):");
-    out::list(
-        &config::PROXY_TOOLS
-            .iter()
-            .map(|s| s.as_ref())
-            .collect::<Vec<_>>(),
-    );
-
     if !apps.is_empty() {
         out::section("apps:");
         out::list(&apps.iter().map(|s| s.as_str()).collect::<Vec<_>>());
@@ -198,10 +194,7 @@ fn wait_for_state(changed_at: std::time::SystemTime, timeout: Duration) -> Optio
             return Some(state);
         }
     }
-    fs::read_to_string(&path)
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+    None
 }
 
 pub fn import(root: &Path, link: Option<&str>, force: bool) -> Result<()> {
@@ -517,6 +510,511 @@ pub fn check(root: &Path) -> Result<()> {
     Ok(())
 }
 
+const DIAGNOSTIC_TESTS: [(&str, &str, &str, bool); 6] = [
+    ("direct", "xvpn off", "direct connection", true),
+    ("sites", "xvpn sites set ip.me", "site routing", false),
+    ("profiles", "xvpn <index>", "every profile", true),
+    (
+        "profile-commands",
+        "xvpn <index> <cmd>",
+        "both curl commands through every profile",
+        true,
+    ),
+    (
+        "modes",
+        "xvpn default / xvpn on",
+        "routing mode transitions",
+        false,
+    ),
+    (
+        "firefox",
+        "xvpn apps set Firefox",
+        "Firefox app routing",
+        false,
+    ),
+];
+
+const DIAGNOSTIC_LABEL_WIDTH: usize = 24;
+const DIAGNOSTIC_DISPLAY_WIDTH: usize = 78;
+
+struct Spinner {
+    running: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Spinner {
+    fn start() -> Self {
+        let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let active = running.clone();
+        let thread = std::thread::spawn(move || {
+            let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+            let mut index = 0;
+            while active.load(std::sync::atomic::Ordering::Relaxed) {
+                eprint!("\r  {} testing...", frames[index % frames.len()]);
+                let _ = io::stderr().flush();
+                index += 1;
+                std::thread::sleep(Duration::from_millis(90));
+            }
+        });
+        Self {
+            running,
+            thread: Some(thread),
+        }
+    }
+
+    fn stop(mut self) {
+        self.running
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        eprint!("\r\x1b[2K");
+        let _ = io::stderr().flush();
+    }
+}
+
+fn diagnostic_menu_labels() -> Vec<String> {
+    DIAGNOSTIC_TESTS
+        .iter()
+        .map(|(_, command, description, _)| {
+            format!("{command:<DIAGNOSTIC_LABEL_WIDTH$} - {description}")
+        })
+        .collect()
+}
+
+struct DiagnosticLog {
+    path: PathBuf,
+}
+
+impl DiagnosticLog {
+    fn new() -> Result<Self> {
+        let path = config::log_file("diagnose");
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("creating diagnose log directory: {e}"))?;
+        }
+        Ok(Self { path })
+    }
+
+    fn write(&self, message: &str) -> Result<()> {
+        use std::fs::OpenOptions;
+        use std::io::Write as _;
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| format!("diagnose timestamp: {e}"))?
+            .as_secs();
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .map_err(|e| format!("opening diagnose log: {e}"))?;
+        writeln!(file, "[{timestamp}] {message}")
+            .map_err(|e| format!("writing diagnose log: {e}"))?;
+        println!("  {}", truncate_diagnostic_display(message));
+        io::stdout()
+            .flush()
+            .map_err(|e| format!("flushing diagnose output: {e}"))
+    }
+}
+
+pub fn diagnose(root: &Path, test: Option<&str>) -> Result<()> {
+    let selected = match test {
+        Some("all") => (0..DIAGNOSTIC_TESTS.len()).collect(),
+        Some(name) => vec![diagnostic_index(name)?],
+        None => {
+            let labels = diagnostic_menu_labels();
+            let defaults: Vec<_> = DIAGNOSTIC_TESTS
+                .iter()
+                .map(|(_, _, _, default)| *default)
+                .collect();
+            MultiSelect::new()
+                .with_prompt("Select diagnose checks (Space toggles, Enter runs)")
+                .items(&labels)
+                .defaults(&defaults)
+                .interact()
+                .map_err(|e| format!("selecting diagnose checks: {e}"))?
+        }
+    };
+
+    let log = DiagnosticLog::new()?;
+    log.write(&format!("BEGIN selected={selected:?}"))?;
+    let mut failures = Vec::new();
+
+    for index in selected {
+        let (name, _, description, _) = DIAGNOSTIC_TESTS[index];
+        println!("\n[TEST] {description} ({name})");
+        log.write(&format!("START test={name}"))?;
+        let started = Instant::now();
+        let spinner = Spinner::start();
+        out::set_quiet(true);
+        let result = run_diagnostic_test(root, name, &log);
+        out::set_quiet(false);
+        spinner.stop();
+        log.write(&format!(
+            "END test={name} duration_ms={}",
+            started.elapsed().as_millis()
+        ))?;
+        match result {
+            Ok(()) => {
+                println!("PASS {name}");
+                log.write(&format!("PASS test={name}"))?;
+            }
+            Err(error) => {
+                println!("FAIL {name}: {error}");
+                log.write(&format!("FAIL test={name} error={error}"))?;
+                failures.push(format!("{name}: {error}"));
+            }
+        }
+    }
+
+    let cleanup = set_mode(root, Mode::Off);
+    if let Err(error) = &cleanup {
+        log.write(&format!("FAIL final cleanup=xvpn off error={error}"))?;
+        failures.push(format!("final cleanup: {error}"));
+    } else {
+        log.write("CLEANUP final=xvpn off")?;
+    }
+
+    if failures.is_empty() {
+        println!("\nDIAGNOSE PASS");
+        log.write("END result=PASS")?;
+        Ok(())
+    } else {
+        println!("\nDIAGNOSE FAILED:");
+        for failure in &failures {
+            println!("  - {failure}");
+        }
+        log.write(&format!("END result=FAIL failures={failures:?}"))?;
+        Err(String::new())
+    }
+}
+
+fn diagnostic_index(name: &str) -> Result<usize> {
+    DIAGNOSTIC_TESTS
+        .iter()
+        .position(|(candidate, _, _, _)| *candidate == name)
+        .ok_or_else(|| {
+            format!(
+                "unknown diagnose test '{name}' (use one of: direct, sites, profiles, \
+                 profile-commands, modes, firefox, all)"
+            )
+        })
+}
+
+fn run_diagnostic_test(root: &Path, name: &str, log: &DiagnosticLog) -> Result<()> {
+    let result = match name {
+        "direct" => diagnostic_direct(root, log),
+        "sites" => diagnostic_sites(root, log),
+        "profiles" => diagnostic_profiles(root, log),
+        "profile-commands" => diagnostic_profile_commands(root, log),
+        "modes" => diagnostic_modes(root, log),
+        "firefox" => diagnostic_firefox(root, log),
+        _ => Err(format!("unknown diagnose test '{name}'")),
+    };
+    let cleanup = set_mode(root, Mode::Off);
+    log.write(if cleanup.is_ok() {
+        "CLEANUP test=xvpn off result=PASS"
+    } else {
+        "CLEANUP test=xvpn off result=FAIL"
+    })?;
+    result.and(cleanup)
+}
+
+fn diagnostic_direct(root: &Path, log: &DiagnosticLog) -> Result<()> {
+    log.write("COMMAND xvpn off")?;
+    set_mode(root, Mode::Off)?;
+    check_curls(log).map(|_| ())
+}
+
+fn diagnostic_sites(root: &Path, log: &DiagnosticLog) -> Result<()> {
+    log.write("COMMAND xvpn off")?;
+    set_mode(root, Mode::Off)?;
+    let path = root.join(config::DEFAULT);
+    let had_site = network::listed_sites(&path)?
+        .iter()
+        .any(|site| site == "ip.me");
+    let mut added = false;
+    let result = (|| {
+        log.write("COMMAND xvpn sites set ip.me")?;
+        add_site(root, "ip.me")?;
+        added = true;
+        log.write("COMMAND xvpn default")?;
+        set_mode(root, Mode::Default)?;
+        let (ip_me, ifconfig) = check_curls(log)?;
+        if ip_me == ifconfig {
+            return Err("site routing returned the same public IP for both hosts".into());
+        }
+        Ok(())
+    })();
+    let mut cleanup_errors = Vec::new();
+    if added && !had_site {
+        cleanup_log(log, "COMMAND xvpn sites remove ip.me", &mut cleanup_errors);
+        if let Err(error) = remove_site(root, "ip.me") {
+            cleanup_errors.push(error);
+        }
+    }
+    cleanup_log(log, "COMMAND xvpn default", &mut cleanup_errors);
+    if let Err(error) = set_mode(root, Mode::Default) {
+        cleanup_errors.push(error);
+    } else if let Err(error) = check_curls(log).map(|_| ()) {
+        cleanup_errors.push(error);
+    }
+    cleanup_log(log, "COMMAND xvpn off", &mut cleanup_errors);
+    if let Err(error) = set_mode(root, Mode::Off) {
+        cleanup_errors.push(error);
+    }
+    match (result, cleanup_errors.is_empty()) {
+        (Err(error), _) => Err(error),
+        (Ok(()), true) => Ok(()),
+        (Ok(()), false) => Err(format!("site cleanup failed: {cleanup_errors:?}")),
+    }
+}
+
+fn cleanup_log(log: &DiagnosticLog, message: &str, errors: &mut Vec<String>) {
+    if let Err(error) = log.write(message) {
+        errors.push(error);
+    }
+}
+
+fn diagnostic_profiles(root: &Path, log: &DiagnosticLog) -> Result<()> {
+    log.write("COMMAND xvpn off")?;
+    set_mode(root, Mode::Off)?;
+    log.write("COMMAND curl -4 -sS ip.me (direct baseline)")?;
+    let direct_ip = diagnose_curl(log, "ip.me")?;
+    log.write(&format!("DIRECT IP {direct_ip}"))?;
+
+    let count = profile::list(root).len();
+    let mut failures = Vec::new();
+    let mut profile_ips = Vec::new();
+    for index in 1..=count {
+        log.write(&format!("COMMAND xvpn {index}"))?;
+        if let Err(error) = use_profile(root, index as u16) {
+            failures.push(format!("profile {index}: {error}"));
+            continue;
+        }
+        log.write(&format!("COMMAND curl -4 -sS ip.me (profile {index})"))?;
+        match diagnose_curl(log, "ip.me") {
+            Ok(ip) if ip == direct_ip => {
+                failures.push(format!(
+                    "profile {index}: returned direct IP {ip}, traffic is not using this profile"
+                ));
+            }
+            Ok(ip) if profile_ips.iter().any(|(_, seen)| seen == &ip) => {
+                let other = profile_ips
+                    .iter()
+                    .find(|(_, seen)| seen == &ip)
+                    .map(|(other, _)| *other)
+                    .unwrap_or(0);
+                failures.push(format!(
+                    "profile {index}: returned the same IP {ip} as profile {other}"
+                ));
+                profile_ips.push((index, ip));
+            }
+            Ok(ip) => profile_ips.push((index, ip)),
+            Err(error) => failures.push(format!("profile {index}: {error}")),
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
+    }
+}
+
+fn diagnostic_profile_commands(root: &Path, log: &DiagnosticLog) -> Result<()> {
+    let count = profile::list(root).len();
+    let mut failures = Vec::new();
+    for index in 0..=count {
+        log.write("COMMAND xvpn off")?;
+        if let Err(error) = set_mode(root, Mode::Off) {
+            failures.push(format!("profile {index} start: {error}"));
+            continue;
+        }
+        for host in ["ip.me", "ifconfig.me"] {
+            log.write(&format!("COMMAND xvpn {index} curl -4 {host}"))?;
+            if let Err(error) = run_app(
+                root,
+                index as u16,
+                &[String::from("curl"), String::from("-4"), host.into()],
+            ) {
+                failures.push(format!("profile {index} {host}: {error}"));
+            }
+        }
+        log.write("COMMAND xvpn off")?;
+        if let Err(error) = set_mode(root, Mode::Off) {
+            failures.push(format!("profile {index} cleanup: {error}"));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
+    }
+}
+
+fn diagnostic_modes(root: &Path, log: &DiagnosticLog) -> Result<()> {
+    for (name, mode) in [
+        ("off", Mode::Off),
+        ("default", Mode::Default),
+        ("on", Mode::On),
+    ] {
+        log.write(&format!("COMMAND xvpn {name}"))?;
+        set_mode(root, mode)?;
+        check_curls(log)?;
+        log.write("COMMAND xvpn off")?;
+        set_mode(root, Mode::Off)?;
+    }
+    Ok(())
+}
+
+fn diagnostic_firefox(root: &Path, log: &DiagnosticLog) -> Result<()> {
+    log.write("COMMAND xvpn off")?;
+    set_mode(root, Mode::Off)?;
+    let path = root.join(config::DEFAULT);
+    let had_app = network::listed_apps(&path)?
+        .iter()
+        .any(|app| app == "Firefox");
+    let mut added = false;
+    let result = (|| {
+        log.write("COMMAND xvpn apps set Firefox")?;
+        add_app(root, "Firefox")?;
+        added = true;
+        log.write("COMMAND xvpn default")?;
+        set_mode(root, Mode::Default)?;
+        log.write("COMMAND open -a Firefox https://ifconfig.me")?;
+        command_ok("open", &["-a", "Firefox", "https://ifconfig.me"])?;
+        println!("Check the IP displayed in Firefox, then press Enter.");
+        let mut input = String::new();
+        io::stdin()
+            .read_line(&mut input)
+            .map_err(|e| format!("reading Firefox confirmation: {e}"))?;
+        Ok(())
+    })();
+    let mut cleanup_errors = Vec::new();
+    if added && !had_app {
+        cleanup_log(log, "COMMAND xvpn apps remove Firefox", &mut cleanup_errors);
+        if let Err(error) = remove_app(root, "Firefox") {
+            cleanup_errors.push(error);
+        }
+    }
+    cleanup_log(log, "COMMAND xvpn default", &mut cleanup_errors);
+    if let Err(error) = set_mode(root, Mode::Default) {
+        cleanup_errors.push(error);
+    }
+    cleanup_log(log, "COMMAND xvpn off", &mut cleanup_errors);
+    if let Err(error) = set_mode(root, Mode::Off) {
+        cleanup_errors.push(error);
+    }
+    match (result, cleanup_errors.is_empty()) {
+        (Err(error), _) => Err(error),
+        (Ok(()), true) => Ok(()),
+        (Ok(()), false) => Err(format!("Firefox cleanup failed: {cleanup_errors:?}")),
+    }
+}
+
+fn check_curls(log: &DiagnosticLog) -> Result<(String, String)> {
+    let ip_me = diagnose_curl(log, "ip.me")?;
+    let ifconfig = diagnose_curl(log, "ifconfig.me")?;
+    Ok((ip_me, ifconfig))
+}
+
+fn diagnose_curl(log: &DiagnosticLog, host: &str) -> Result<String> {
+    let command = format!("curl -4 -sS {host}");
+    log.write(&format!("COMMAND {command}"))?;
+    let output = Command::new("curl")
+        .args(["-4", "-sS", host])
+        .output()
+        .map_err(|e| format!("{command}: {e}"))?;
+    let stdout = compact_diagnostic_output(&String::from_utf8_lossy(&output.stdout));
+    let stderr = compact_diagnostic_output(&String::from_utf8_lossy(&output.stderr));
+    log.write(&format!(
+        "OUTPUT command={command:?} status={} stdout={stdout:?} stderr={stderr:?}",
+        output.status
+    ))?;
+    if !stdout.is_empty() {
+        log.write(&format!("STDOUT {stdout}"))?;
+    }
+    if !stderr.is_empty() {
+        log.write(&format!("STDERR {stderr}"))?;
+    }
+    if !output.status.success() {
+        return Err(format!("{command} failed"));
+    }
+    if stdout.is_empty() {
+        return Err(format!("{command} returned no IP"));
+    }
+    Ok(stdout)
+}
+
+fn compact_diagnostic_output(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn truncate_diagnostic_display(value: &str) -> String {
+    let max_chars = DIAGNOSTIC_DISPLAY_WIDTH.saturating_sub(2);
+    let mut chars = value.chars();
+    let truncated: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{truncated}…")
+    } else {
+        truncated
+    }
+}
+
+#[cfg(test)]
+mod diagnose_tests {
+    use super::*;
+
+    #[test]
+    fn named_tests_keep_execution_order() {
+        let names: Vec<_> = DIAGNOSTIC_TESTS
+            .iter()
+            .map(|(name, _, _, _)| *name)
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "direct",
+                "sites",
+                "profiles",
+                "profile-commands",
+                "modes",
+                "firefox"
+            ]
+        );
+    }
+
+    #[test]
+    fn named_tests_reject_unknown_names() {
+        assert!(diagnostic_index("not-a-test").is_err());
+        assert!(diagnostic_index("all").is_err());
+    }
+
+    #[test]
+    fn menu_labels_align_command_names() {
+        let labels = diagnostic_menu_labels();
+        let dash_positions: Vec<_> = labels
+            .iter()
+            .map(|label| label.find(" - ").unwrap())
+            .collect();
+        assert!(dash_positions
+            .windows(2)
+            .all(|positions| positions[0] == positions[1]));
+    }
+
+    #[test]
+    fn diagnostic_output_is_single_line_and_bounded() {
+        let output = compact_diagnostic_output(" first\n second\tthird ");
+        assert_eq!(output, "first second third");
+        let long = "x".repeat(500);
+        assert_eq!(compact_diagnostic_output(&long), long);
+
+        let displayed = truncate_diagnostic_display(&long);
+        assert_eq!(displayed.chars().count(), DIAGNOSTIC_DISPLAY_WIDTH - 1);
+        assert!(displayed.ends_with('…'));
+    }
+}
+
 pub fn repair(root: &Path) -> Result<()> {
     if let Err(e) = ensure_dependencies() {
         out::warn(&e);
@@ -694,8 +1192,13 @@ pub fn run_app(root: &Path, index: u16, trailing: &[String]) -> Result<()> {
     let mut cmd = Command::new(app);
     cmd.args(app_args);
     cmd.stdin(Stdio::inherit());
-    cmd.stdout(Stdio::inherit());
-    cmd.stderr(Stdio::inherit());
+    if out::is_quiet() {
+        cmd.stdout(Stdio::null());
+        cmd.stderr(Stdio::null());
+    } else {
+        cmd.stdout(Stdio::inherit());
+        cmd.stderr(Stdio::inherit());
+    }
     cmd.env("ALL_PROXY", format!("socks5://127.0.0.1:{socks_port}"));
     cmd.env("all_proxy", format!("socks5://127.0.0.1:{socks_port}"));
     cmd.env("HTTP_PROXY", format!("http://127.0.0.1:{http_port}"));
@@ -714,7 +1217,11 @@ pub fn run_app(root: &Path, index: u16, trailing: &[String]) -> Result<()> {
     let _ = fs::remove_file(&tmp_path);
     let _ = fs::remove_file(&log_path);
 
-    std::process::exit(status.code().unwrap_or(1));
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("{app} exited with {status}"))
+    }
 }
 
 pub fn agent(cmd: crate::cli::AgentCmd, _root: &Path) -> Result<()> {
@@ -736,14 +1243,35 @@ pub fn agent(cmd: crate::cli::AgentCmd, _root: &Path) -> Result<()> {
 }
 
 fn launchctl(args: &[String]) -> Result<()> {
-    let status = Command::new("launchctl")
+    let output = Command::new("launchctl")
         .args(args)
-        .status()
+        .output()
         .map_err(|e| format!("launchctl failed: {e}"))?;
-    if !status.success() {
-        return Err(format!("launchctl exited with {status}"));
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if detail.is_empty() {
+            format!("launchctl exited with {}", output.status)
+        } else {
+            format!("launchctl failed: {detail}")
+        });
     }
     Ok(())
+}
+
+fn launchctl_bootout(id: &str) -> Result<()> {
+    let output = Command::new("launchctl")
+        .args(["bootout", id])
+        .output()
+        .map_err(|e| format!("launchctl failed: {e}"))?;
+    if output.status.success() || output.status.code() == Some(3) {
+        return Ok(());
+    }
+    let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    Err(if detail.is_empty() {
+        format!("launchctl exited with {}", output.status)
+    } else {
+        format!("launchctl failed: {detail}")
+    })
 }
 
 fn install_agent(binary: &Path) -> Result<()> {
@@ -759,6 +1287,8 @@ fn install_agent(binary: &Path) -> Result<()> {
 \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\"><plist version=\"1.0\"><dict>\
 <key>Label</key><string>com.xvpn</string><key>ProgramArguments</key><array>\
 <string>{}</string><string>--supervise</string></array><key>RunAtLoad</key><true/>\
+<key>EnvironmentVariables</key><dict><key>PATH</key><string>\
+/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string></dict>\
 <key>KeepAlive</key><true/><key>StandardOutPath</key><string>{}</string>\
 <key>StandardErrorPath</key><string>{}</string></dict></plist>",
                 binary.display(),
@@ -767,13 +1297,14 @@ fn install_agent(binary: &Path) -> Result<()> {
             );
             fs::write(&plist, content).map_err(|e| format!("writing agent: {e}"))?;
             let id = format!("gui/{}/com.xvpn", unsafe { libc::getuid() });
-            let _ = launchctl(&["bootout".into(), id.clone()]);
+            launchctl_bootout(&id)?;
             launchctl(&[
                 "bootstrap".into(),
                 format!("gui/{}", unsafe { libc::getuid() }),
                 plist.display().to_string(),
             ])?;
             launchctl(&["enable".into(), id])?;
+            out::status("✓", "user agent loaded");
         }
         network::Os::Linux => {
             let dir = config::home_dir().join(".config/systemd/user");
@@ -797,7 +1328,7 @@ fn stop_agent() -> Result<()> {
     match network::os() {
         network::Os::MacOs => {
             let id = format!("gui/{}/com.xvpn", unsafe { libc::getuid() });
-            let _ = launchctl(&["bootout".into(), id]);
+            launchctl_bootout(&id)?;
         }
         network::Os::Linux => {
             command_ok("systemctl", &["--user", "disable", "--now", "xvpn.service"])?;

@@ -1,22 +1,48 @@
 use std::io::{self, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static QUIET: AtomicBool = AtomicBool::new(false);
+
+pub fn set_quiet(quiet: bool) {
+    QUIET.store(quiet, Ordering::Relaxed);
+}
+
+pub fn is_quiet() -> bool {
+    QUIET.load(Ordering::Relaxed)
+}
 
 pub fn kv(key: &str, value: &str) {
+    if QUIET.load(Ordering::Relaxed) {
+        return;
+    }
     println!("{:<10} {}", key, value);
 }
 
 pub fn kv_prefix(prefix: &str, key: &str, value: &str) {
+    if QUIET.load(Ordering::Relaxed) {
+        return;
+    }
     println!("{} {:<10} {}", prefix, key, value);
 }
 
 pub fn status(marker: &str, msg: &str) {
+    if QUIET.load(Ordering::Relaxed) {
+        return;
+    }
     println!("{} {}", marker, msg);
 }
 
 pub fn section(title: &str) {
+    if QUIET.load(Ordering::Relaxed) {
+        return;
+    }
     println!("{}", title);
 }
 
 pub fn list(items: &[&str]) {
+    if QUIET.load(Ordering::Relaxed) {
+        return;
+    }
     if items.is_empty() {
         println!("  (none)");
     } else {
@@ -27,6 +53,9 @@ pub fn list(items: &[&str]) {
 }
 
 pub fn table(rows: &[Vec<&str>], header: bool) {
+    if QUIET.load(Ordering::Relaxed) {
+        return;
+    }
     if rows.is_empty() {
         return;
     }
@@ -60,14 +89,23 @@ pub fn table(rows: &[Vec<&str>], header: bool) {
 }
 
 pub fn error(msg: &str) {
+    if QUIET.load(Ordering::Relaxed) {
+        return;
+    }
     eprintln!("✗ {}", msg);
 }
 
 pub fn warn(msg: &str) {
+    if QUIET.load(Ordering::Relaxed) {
+        return;
+    }
     eprintln!("~ {}", msg);
 }
 
 pub fn info(msg: &str) {
+    if QUIET.load(Ordering::Relaxed) {
+        return;
+    }
     println!("→ {}", msg);
 }
 

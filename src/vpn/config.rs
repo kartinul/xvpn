@@ -594,8 +594,6 @@ pub fn direct_xray_config(socks_port: u16, http_port: u16) -> Value {
     })
 }
 
-pub const PROXY_TOOLS: [&str; 6] = ["curl", "git", "brew", "ssh", "node", "python3"];
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Scope {
     Global,
@@ -614,9 +612,7 @@ pub fn singbox_config(scope: Scope, ingress: Ingress) -> Value {
         json!({ "action": "sniff" }),
         json!({ "protocol": "dns", "action": "hijack-dns" }),
     ];
-    if scope == Scope::Selective {
-        rules.push(json!({ "process_name": PROXY_TOOLS, "outbound": "xray" }));
-    } else {
+    if scope != Scope::Selective {
         rules.push(json!({ "ip_is_private": true, "outbound": "direct" }));
     }
 

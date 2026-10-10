@@ -81,6 +81,11 @@ pub enum Command {
     Repair,
     /// Delete generated configs and restore stock defaults
     Reset,
+    /// Interactive diagnostics; pass a test name to run it directly
+    Diagnose {
+        /// Named test to run without the interactive menu (`all` runs all tests)
+        test: Option<String>,
+    },
 
     /// Manage the supervisor agent
     #[command(hide = true)]
@@ -88,6 +93,9 @@ pub enum Command {
         #[command(subcommand)]
         cmd: Option<AgentCmd>,
     },
+    /// Restart the user supervisor agent
+    #[command(hide = true)]
+    Restart,
 }
 
 #[derive(Subcommand, Debug)]
@@ -213,10 +221,12 @@ pub fn dispatch(cli: Cli) {
         Some(Command::Logs) => handlers::logs(),
         Some(Command::Repair) => handlers::repair(&root),
         Some(Command::Reset) => handlers::reset(&root),
+        Some(Command::Diagnose { test }) => handlers::diagnose(&root, test.as_deref()),
         Some(Command::Agent { cmd }) => {
             let cmd = cmd.unwrap_or(AgentCmd::Install);
             handlers::agent(cmd, &root)
         }
+        Some(Command::Restart) => handlers::agent(AgentCmd::Restart, &root),
     };
 
     handlers::run(result);

@@ -72,6 +72,7 @@ Select a mode:
 xvpn default       # selective routing
 xvpn on            # all traffic; may request sudo for TUN
 xvpn off           # stop routing
+xvpn 1             # select profile 1; enables full routing if currently off
 ```
 
 Configure selective routing:
@@ -89,13 +90,51 @@ xvpn logs
 xvpn check
 ```
 
+Restart the user supervisor after rebuilding:
+
+```sh
+xvpn restart
+```
+
+Run the interactive end-to-end diagnostic:
+
+```sh
+xvpn diagnose
+```
+
+The menu uses arrow keys to move, Space to toggle checks, and Enter to run.
+The default selections cover direct connectivity and both all-profile checks.
+Site, routing-mode, and Firefox checks are opt-in because they change routing
+or configuration. Every check cleans up and ends with routing off.
+
+Each check can also run without the menu:
+
+```sh
+xvpn diagnose direct
+xvpn diagnose sites
+xvpn diagnose profiles
+xvpn diagnose profile-commands
+xvpn diagnose modes
+xvpn diagnose firefox
+xvpn diagnose all
+```
+
+The diagnostic log is written to `~/.local/state/xvpn/diagnose.log`. Network
+The profile check switches through all profiles without turning routing off
+between profiles, then performs one final `xvpn off` cleanup after the last
+profile. Other checks use only `curl -4 ip.me` and `curl -4 ifconfig.me`. The Firefox check
+opens `https://ifconfig.me` for a manual check and does not use curl.
+
 ## Privilege behavior
 
 xray and Linux gateway/TProxy routing run as the current user. TUN routing may
-need root privileges. The foreground command requests authorization only for a
-transition that needs it; the background supervisor uses non-interactive sudo.
-If the sudoers rule or cached authorization is unavailable, xvpn reports the
-failure instead of claiming that routing stopped.
+need root privileges. The foreground `xvpn` command requests authorization exactly when a privileged
+sing-box transition is needed. It first checks sudo's existing authorization
+timestamp, so an already-authorized session is not prompted again. The
+background supervisor uses non-interactive sudo for the actual start/stop; if
+authorization expires, the next foreground mode/profile command prompts again.
+A user LaunchAgent cannot display a terminal prompt, so the first transition
+must be initiated from a terminal (or use a sudoers rule).
 
 ## Building from source
 
@@ -104,6 +143,9 @@ failure instead of claiming that routing stopped.
 ```sh
 make
 ```
+
+The build also clears the previous xvpn diagnostic, supervisor, xray, and
+sing-box logs. To clear those logs without rebuilding, run `make clean-logs`.
 
 The build artifact is also written to `target/release/xvpn`. Make sure
 `~/.local/bin` is on your shell's `PATH`; a Makefile cannot change the `PATH`

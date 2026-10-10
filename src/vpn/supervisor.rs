@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -49,8 +50,12 @@ struct Proxy {
 }
 
 impl Proxy {
-    fn has_exited(&mut self) -> bool {
-        matches!(self.child.try_wait(), Ok(Some(_)))
+    fn exit_reason(&mut self) -> Option<String> {
+        match self.child.try_wait() {
+            Ok(Some(status)) => Some(format!("exited with {status}")),
+            Err(error) => Some(format!("could not query process: {error}")),
+            Ok(None) => None,
+        }
     }
 
     fn past_grace(&self) -> bool {
@@ -63,7 +68,7 @@ pub struct Plan {
     pub key: String,
 }
 
-pub fn plan(root: &Path, sudo_cache: &mut Option<(Instant, bool)>) -> Plan {
+pub fn plan(root: &Path) -> Plan {
     let mode_path = root.join(config::MODE);
     let mode = fs::read_to_string(&mode_path)
         .map(|s| s.trim().to_string())
@@ -108,19 +113,6 @@ pub fn plan(root: &Path, sudo_cache: &mut Option<(Instant, bool)>) -> Plan {
             };
         }
         key.push_str(&format!(":{sidecar}:{}", mtime(&path)));
-
-        if ingress() == Ingress::Tun && !config::is_root() {
-            let ready = cached_sudo(sudo_cache);
-            key.push_str(&format!(":sudo:{ready}"));
-            if !ready {
-                return Plan {
-                    want: Want::Failed,
-                    key: "failed:this mode needs root for the tun interface — \
-                      run `xvpn supervise` in foreground or configure sing-box in sudoers"
-                        .to_string(),
-                };
-            }
-        }
     }
 
     Plan { want, key }
@@ -226,40 +218,6 @@ pub fn is_running() -> bool {
     false
 }
 
-fn sudo_ready() -> bool {
-    let check_true = Command::new("sudo")
-        .args(["-n", "true"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if check_true {
-        return true;
-    }
-    Command::new("sudo")
-        .args(["-n", "sing-box", "version"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-fn cached_sudo(cache: &mut Option<(Instant, bool)>) -> bool {
-    let now = Instant::now();
-    if let Some((ts, ready)) = *cache {
-        if now.duration_since(ts) < Duration::from_secs(300) {
-            return ready;
-        }
-    }
-    let ready = sudo_ready();
-    *cache = Some((now, ready));
-    ready
-}
-
 fn sidecar_needs_root() -> bool {
     ingress() == Ingress::Tun && !config::is_root()
 }
@@ -272,25 +230,71 @@ fn mode_needs_root(root: &Path, mode: &str) -> bool {
         || (mode == "default" && network::read_networks(root).matches(&network::dns_servers()))
 }
 
-pub fn authorize_transition(root: &Path, mode: &str) -> Result<()> {
-    let current = fs::read_to_string(state_path())
-        .map(|state| matches!(state.trim(), "on" | "selective"))
+fn root_process_ids(pid: u32) -> Vec<String> {
+    let output = Command::new("pgrep")
+        .args(["-P", &pid.to_string()])
+        .output()
+        .ok();
+    let mut ids = output
+        .filter(|output| output.status.success())
+        .map(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .split_whitespace()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    ids.push(pid.to_string());
+    ids
+}
+
+fn root_proxy_running(root: &Path) -> bool {
+    let config = root.join(config::ON);
+    Command::new("pgrep")
+        .args(["-f", &format!("sing-box run -c {}", config.display())])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
         .unwrap_or(false)
-        || fs::read_to_string(root.join(config::MODE))
-            .map(|current| mode_needs_root(root, current.trim()))
-            .unwrap_or(false);
+}
+
+pub fn authorize_transition(root: &Path, mode: &str) -> Result<()> {
+    let current_mode_needs_root = fs::read_to_string(root.join(config::MODE))
+        .map(|current| mode_needs_root(root, current.trim()))
+        .unwrap_or(false);
+    let current = current_mode_needs_root || root_proxy_running(root);
     if !mode_needs_root(root, mode) && !(mode == "off" && current && sidecar_needs_root()) {
         return Ok(());
     }
-    let status = Command::new("sudo")
-        .arg("-v")
+    let cached = Command::new("sudo")
+        .args(["-n", "-v"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()
-        .map_err(|e| format!("could not request sudo authorization: {e}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err("sudo authorization is required for this transition".into())
+        .map(|status| status.success())
+        .unwrap_or(false);
+    if !cached {
+        let status = Command::new("sudo")
+            .arg("-v")
+            .status()
+            .map_err(|e| format!("could not request sudo authorization: {e}"))?;
+        if !status.success() {
+            return Err("sudo authorization is required for this transition".into());
+        }
     }
+    if mode == "off" && sidecar_needs_root() && root_proxy_running(root) {
+        stop_root_proxy(root)?;
+    }
+    Ok(())
+}
+
+pub fn authorize_profile_transition(root: &Path, mode: &str) -> Result<()> {
+    if root_proxy_running(root) {
+        authorize_transition(root, "off")?;
+    }
+    authorize_transition(root, mode)
 }
 
 fn spawn(program: &str, config_path: &Path, elevate: bool) -> Result<Proxy> {
@@ -327,7 +331,11 @@ fn spawn(program: &str, config_path: &Path, elevate: bool) -> Result<Proxy> {
     let child = command
         .args(["run", "-c"])
         .arg(config_path)
-        .stdin(Stdio::null())
+        .stdin(if elevate {
+            Stdio::inherit()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::null())
         .stderr(stderr)
         .spawn()
@@ -369,17 +377,15 @@ pub fn supervise(root: &Path) -> Result<()> {
     let mut running: BTreeMap<&'static str, Proxy> = BTreeMap::new();
     let mut applied: Option<String> = None;
     let mut last_validated = Instant::now() - REVALIDATE_EVERY;
-    let mut sudo_cache: Option<(Instant, bool)> = None;
-
     while !shutdown.load(Ordering::SeqCst) {
-        let plan = plan(root, &mut sudo_cache);
+        let plan = plan(root);
         let key = plan.key.clone();
 
-        let stale: Vec<(&'static str, &'static str)> = running
+        let stale: Vec<(&'static str, String)> = running
             .iter_mut()
             .filter_map(|(name, p)| {
-                if p.past_grace() && p.has_exited() {
-                    Some((*name, "exited unexpectedly"))
+                if p.past_grace() && !p.elevated {
+                    p.exit_reason().map(|reason| (*name, reason))
                 } else {
                     None
                 }
@@ -403,13 +409,13 @@ pub fn supervise(root: &Path) -> Result<()> {
                         key.trim_start_matches("failed:")
                     ));
                 }
-                let _ = stop_all(&mut running);
+                let _ = stop_all(root, &mut running);
                 publish("failed");
                 next_applied = Some(key);
             } else {
                 if changed {
                     log(format!("applying {}", plan.want.as_str()));
-                    if stop_all(&mut running) && start_for(root, plan.want, &mut running) {
+                    if stop_all(root, &mut running) && start_for(root, plan.want, &mut running) {
                         publish(plan.want.as_str());
                         next_applied = Some(key);
                     } else {
@@ -429,7 +435,7 @@ pub fn supervise(root: &Path) -> Result<()> {
     }
 
     log("shutting down");
-    let _ = stop_all(&mut running);
+    let _ = stop_all(root, &mut running);
     let mode_path = root.join(config::MODE);
     let _ = fs::write(&mode_path, b"off\n");
     let _ = fs::remove_file(state_path());
@@ -469,46 +475,263 @@ fn start_for(root: &Path, want: Want, running: &mut BTreeMap<&'static str, Proxy
         }
     }
 
+    let ready = (0..50).any(|_| {
+        if TcpStream::connect(("127.0.0.1", config::SOCKS_PORT)).is_ok() {
+            true
+        } else {
+            std::thread::sleep(Duration::from_millis(100));
+            false
+        }
+    });
+    if !ready {
+        log("xray did not become ready");
+        let _ = stop_all(root, running);
+        publish("failed");
+        return false;
+    }
+
     let Some(sidecar) = want.sidecar() else {
         return true;
     };
     let elevate = sidecar_needs_root();
     if elevate {
-        log("tun mode needs root — starting sing-box with cached sudo");
+        log("tun mode needs root — using authorized sudo");
     }
     match spawn("sing-box", &root.join(sidecar), elevate) {
-        Ok(p) => {
+        Ok(mut p) => {
+            if elevate {
+                let ready = (0..30).any(|_| {
+                    if root_proxy_running(root) {
+                        true
+                    } else {
+                        std::thread::sleep(Duration::from_millis(100));
+                        false
+                    }
+                });
+                if !ready {
+                    log("root-owned sing-box did not become ready");
+                    let _ = stop_all(root, running);
+                    publish("failed");
+                    return false;
+                }
+            } else {
+                for _ in 0..30 {
+                    if let Some(status) = p.exit_reason() {
+                        log(format!("sing-box failed during startup: {status}"));
+                        let _ = stop_all(root, running);
+                        publish("failed");
+                        return false;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
             running.insert("sing-box", p);
             true
         }
         Err(e) => {
             log(e);
-            let _ = stop_all(running);
+            let _ = stop_all(root, running);
             publish("failed");
             false
         }
     }
 }
 
-fn stop_all(running: &mut BTreeMap<&'static str, Proxy>) -> bool {
+fn stop_all(root: &Path, running: &mut BTreeMap<&'static str, Proxy>) -> bool {
     let mut stopped = true;
-    for (_, mut proxy) in std::mem::take(running) {
+    for (name, mut proxy) in std::mem::take(running) {
         if proxy.elevated {
-            let result = Command::new("sudo")
-                .args(["-n", "pkill", "-x", "sing-box"])
+            let ids = root_process_ids(proxy.child.id());
+            let mut command = Command::new("sudo");
+            command
+                .args(["-n", "kill", "-TERM"])
+                .args(&ids)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-            let child_exited = proxy.child.try_wait().ok().flatten().is_some();
-            if !result.map(|status| status.success()).unwrap_or(false) && !child_exited {
-                log("could not stop root-owned sing-box; run `sudo -v` and retry");
+                .stderr(Stdio::null());
+            let status = command.status();
+            let stop_ok = status
+                .as_ref()
+                .map(|status| status.success())
+                .unwrap_or(false);
+            if !stop_ok && proxy.child.try_wait().ok().flatten().is_none() {
+                log(format!(
+                    "could not stop root-owned sing-box with sudo: {}",
+                    status
+                        .as_ref()
+                        .map(|status| status.to_string())
+                        .unwrap_or_else(|error| error.to_string())
+                ));
+                running.insert(name, proxy);
                 stopped = false;
+                continue;
             }
         }
-        let _ = proxy.child.kill();
-        let _ = proxy.child.wait();
+        if proxy.child.try_wait().ok().flatten().is_none() {
+            if proxy.elevated {
+                for _ in 0..20 {
+                    if proxy.child.try_wait().ok().flatten().is_some() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                if proxy.child.try_wait().ok().flatten().is_none() {
+                    let ids = root_process_ids(proxy.child.id());
+                    let _ = Command::new("sudo")
+                        .args(["-n", "kill", "-KILL"])
+                        .args(&ids)
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status();
+                }
+            } else if let Err(e) = proxy.child.kill() {
+                if proxy.child.try_wait().ok().flatten().is_none() {
+                    log(format!("could not stop proxy: {e}"));
+                    stopped = false;
+                }
+            } else {
+                for _ in 0..20 {
+                    if proxy.child.try_wait().ok().flatten().is_some() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+        }
+        if proxy.child.try_wait().ok().flatten().is_none() {
+            log(format!("{name} did not stop; it will be retried"));
+            running.insert(name, proxy);
+            stopped = false;
+        }
+    }
+    if sidecar_needs_root() && root_proxy_running(root) {
+        let config = root.join(config::ON);
+        let ids = process_ids_for_config(&config);
+        if ids.is_empty() || !kill_root_processes(&ids) || root_proxy_running(root) {
+            log("could not stop root-owned sing-box; xvpn needs sudo authorization");
+            stopped = false;
+        }
     }
     let _ = fs::remove_file(state_path());
     stopped
+}
+
+fn process_ids_for_config(config: &Path) -> Vec<String> {
+    let output = Command::new("pgrep")
+        .args(["-f", &format!("sing-box run -c {}", config.display())])
+        .output()
+        .ok();
+    output
+        .filter(|output| output.status.success())
+        .map(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .split_whitespace()
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn stop_root_proxy(root: &Path) -> Result<()> {
+    let config = root.join(config::ON);
+    let ids = process_ids_for_config(&config);
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let status = Command::new("sudo")
+        .args(["kill", "-TERM"])
+        .args(&ids)
+        .status()
+        .map_err(|e| format!("could not stop root-owned sing-box: {e}"))?;
+    if !status.success() {
+        return Err("could not stop root-owned sing-box".into());
+    }
+    for _ in 0..20 {
+        if !root_proxy_running(root) {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let _ = Command::new("sudo")
+        .args(["kill", "-KILL"])
+        .args(&ids)
+        .status()
+        .map_err(|e| format!("could not force-stop root-owned sing-box: {e}"))?;
+    if root_proxy_running(root) {
+        return Err("root-owned sing-box did not stop".into());
+    }
+    Ok(())
+}
+
+fn kill_root_processes(ids: &[String]) -> bool {
+    let term_status = Command::new("sudo")
+        .args(["-n", "kill", "-TERM"])
+        .args(ids)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    if !term_status {
+        return false;
+    }
+    for _ in 0..20 {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let _ = Command::new("sudo")
+        .args(["-n", "kill", "-KILL"])
+        .args(ids)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cleanup_succeeds_when_user_proxy_exits_before_kill() {
+        let mut child = Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("spawn fixture proxy");
+        let _ = child.wait();
+
+        let mut running = BTreeMap::from([(
+            "xray",
+            Proxy {
+                child,
+                started: Instant::now(),
+                elevated: false,
+            },
+        )]);
+
+        assert!(stop_all(Path::new("/tmp/xvpn-test-root"), &mut running));
+        assert!(running.is_empty());
+    }
+
+    #[test]
+    fn cleanup_waits_for_user_proxy_to_exit_after_kill() {
+        let child = Command::new("sh")
+            .args(["-c", "sleep 30"])
+            .spawn()
+            .expect("spawn fixture proxy");
+
+        let mut running = BTreeMap::from([(
+            "xray",
+            Proxy {
+                child,
+                started: Instant::now(),
+                elevated: false,
+            },
+        )]);
+
+        assert!(stop_all(Path::new("/tmp/xvpn-test-root"), &mut running));
+        assert!(running.is_empty());
+    }
 }

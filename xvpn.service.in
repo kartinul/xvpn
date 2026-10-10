@@ -2,7 +2,7 @@
 # Installed to ~/.config/systemd/user by `make agent`.
 #
 # `on` mode still needs sing-box's tun interface, which needs root on Linux too;
-# the supervisor reaches it through cached sudo rather than running as root.
+# the supervisor reaches it through sudo when TUN routing needs root.
 [Unit]
 Description=xvpn supervisor
 After=network-online.target
