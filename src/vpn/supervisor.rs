@@ -360,7 +360,7 @@ fn hook_shutdown_signals(flag: &Arc<AtomicBool>) {
 fn hook_shutdown_signals(_flag: &Arc<AtomicBool>) {}
 
 pub fn supervise(root: &Path) -> Result<()> {
-    if let Err(e) = crate::cli::handlers::ensure_dependencies() {
+    if let Err(e) = crate::cli::commands::utils::ensure_dependencies() {
         eprintln!("[xvpn] dependency error: {}", e);
         eprintln!("[xvpn] aborting supervisor start – run ./install.sh to install missing tools.");
         return Err(e);

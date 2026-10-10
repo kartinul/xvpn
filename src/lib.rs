@@ -28,7 +28,7 @@ mod tests {
     #[test]
     fn selecting_profile_from_off_enables_full_routing() {
         assert_eq!(
-            cli::handlers::mode_after_profile_selection("off"),
+            cli::commands::profile::mode_after_profile_selection("off"),
             cli::Mode::On
         );
     }

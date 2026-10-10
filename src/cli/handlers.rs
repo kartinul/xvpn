@@ -5,7 +5,19 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use dialoguer::MultiSelect;
+use crossterm::{
+    event::{self, Event, KeyCode, KeyEventKind},
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
+use ratatui::{
+    backend::CrosstermBackend,
+    layout::{Constraint, Direction, Layout},
+    style::{Color, Modifier, Style},
+    text::{Line, Span, Text},
+    widgets::{Block, Borders, Gauge, List, ListItem, Paragraph, Wrap},
+    Terminal,
+};
 
 use crate::cli::{AppsAction, Mode, ProfileCmd, SitesAction};
 use crate::platform::network;
@@ -21,6 +33,7 @@ pub fn use_profile(root: &Path, index: u16) -> Result<()> {
     if index == 0 {
         return set_mode(root, Mode::Off);
     }
+
     let mode = read_mode(root);
     let profiles = profile::list(root);
     let name = profiles
@@ -547,66 +560,44 @@ const DIAGNOSTIC_TESTS: [(&str, &str, &str, bool); 6] = [
     ),
 ];
 
-const DIAGNOSTIC_LABEL_WIDTH: usize = 30;
 const DIAGNOSTIC_DISPLAY_WIDTH: usize = 78;
 
-struct Spinner {
-    running: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    thread: Option<std::thread::JoinHandle<()>>,
+enum TuiEvent {
+    Start(usize),
+    Output(usize, String),
+    Complete(usize, Option<String>),
 }
 
-impl Spinner {
-    fn start() -> Self {
-        let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let active = running.clone();
-        let thread = std::thread::spawn(move || {
-            let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-            let mut index = 0;
-            while active.load(std::sync::atomic::Ordering::Relaxed) {
-                eprint!("\r  {} testing...", frames[index % frames.len()]);
-                let _ = io::stderr().flush();
-                index += 1;
-                std::thread::sleep(Duration::from_millis(90));
-            }
-        });
-        Self {
-            running,
-            thread: Some(thread),
-        }
-    }
-
-    fn stop(mut self) {
-        self.running
-            .store(false, std::sync::atomic::Ordering::Relaxed);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-        eprint!("\r\x1b[2K");
-        let _ = io::stderr().flush();
-    }
-}
-
+#[cfg(test)]
 fn diagnostic_menu_labels() -> Vec<String> {
     DIAGNOSTIC_TESTS
         .iter()
-        .map(|(_, command, description, _)| {
-            format!("{command:<DIAGNOSTIC_LABEL_WIDTH$} - {description}")
-        })
+        .map(|(_, command, description, _)| format!("{command:<30} - {description}"))
         .collect()
 }
 
 struct DiagnosticLog {
     path: PathBuf,
+    live: Option<std::sync::mpsc::Sender<TuiEvent>>,
+    task_index: Option<usize>,
 }
 
 impl DiagnosticLog {
     fn new() -> Result<Self> {
+        Self::with_live(None)
+    }
+
+    fn with_live(live: Option<std::sync::mpsc::Sender<TuiEvent>>) -> Result<Self> {
         let path = config::log_file("diagnose");
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .map_err(|e| format!("creating diagnose log directory: {e}"))?;
         }
-        Ok(Self { path })
+        Ok(Self {
+            path,
+            live,
+            task_index: None,
+        })
     }
 
     fn write(&self, message: &str) -> Result<()> {
@@ -623,33 +614,54 @@ impl DiagnosticLog {
             .map_err(|e| format!("opening diagnose log: {e}"))?;
         writeln!(file, "[{timestamp}] {message}")
             .map_err(|e| format!("writing diagnose log: {e}"))?;
-        println!("  {}", truncate_diagnostic_display(message));
-        io::stdout()
-            .flush()
-            .map_err(|e| format!("flushing diagnose output: {e}"))
+        if let Some(live) = &self.live {
+            let _ = live.send(TuiEvent::Output(
+                self.task_index.unwrap_or_default(),
+                truncate_diagnostic_display(message),
+            ));
+        } else {
+            println!("  {}", truncate_diagnostic_display(message));
+            io::stdout()
+                .flush()
+                .map_err(|e| format!("flushing diagnose output: {e}"))?;
+        }
+        Ok(())
     }
 }
 
 pub fn diagnose(root: &Path, test: Option<&str>, yes: bool) -> Result<()> {
+    let log = DiagnosticLog::new()?;
     let selected = match test {
         Some("all") => (0..DIAGNOSTIC_TESTS.len()).collect(),
         Some(name) => vec![diagnostic_index(name)?],
         None => {
-            let labels = diagnostic_menu_labels();
-            let defaults: Vec<_> = DIAGNOSTIC_TESTS
+            let defaults: Vec<usize> = DIAGNOSTIC_TESTS
                 .iter()
-                .map(|(_, _, _, default)| *default)
+                .enumerate()
+                .filter_map(|(index, (_, _, _, default))| (*default).then_some(index))
                 .collect();
-            MultiSelect::new()
-                .with_prompt("Select diagnose checks (Space toggles, Enter runs)")
-                .items(&labels)
-                .defaults(&defaults)
-                .interact()
-                .map_err(|e| format!("selecting diagnose checks: {e}"))?
+            if yes {
+                if defaults
+                    .iter()
+                    .any(|index| DIAGNOSTIC_TESTS[*index].0 == "profiles")
+                {
+                    diagnostic_profile_preflight(root, &log, yes)?;
+                }
+                return run_diagnostics(root, defaults, yes, log);
+            }
+            if defaults
+                .iter()
+                .any(|index| DIAGNOSTIC_TESTS[*index].0 == "profiles")
+            {
+                diagnostic_profile_preflight(root, &log, yes)?;
+            }
+            return diagnose_tui(root, defaults, yes);
         }
     };
+    run_diagnostics(root, selected, yes, log)
+}
 
-    let log = DiagnosticLog::new()?;
+fn run_diagnostics(root: &Path, selected: Vec<usize>, yes: bool, log: DiagnosticLog) -> Result<()> {
     log.write(&format!("BEGIN selected={selected:?}"))?;
     if selected
         .iter()
@@ -664,11 +676,9 @@ pub fn diagnose(root: &Path, test: Option<&str>, yes: bool) -> Result<()> {
         println!("\n[TEST] {description} ({name})");
         log.write(&format!("START test={name}"))?;
         let started = Instant::now();
-        let spinner = Spinner::start();
         out::set_quiet(true);
         let result = run_diagnostic_test(root, name, &log);
         out::set_quiet(false);
-        spinner.stop();
         log.write(&format!(
             "END test={name} duration_ms={}",
             started.elapsed().as_millis()
@@ -706,6 +716,361 @@ pub fn diagnose(root: &Path, test: Option<&str>, yes: bool) -> Result<()> {
         log.write(&format!("END result=FAIL failures={failures:?}"))?;
         Err(String::new())
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DiagnosticState {
+    Pending,
+    Running,
+    Passed,
+    Failed,
+}
+
+struct TuiTask {
+    selected: bool,
+    state: DiagnosticState,
+    output: Vec<String>,
+    error: Option<String>,
+}
+
+fn diagnose_tui(root: &Path, defaults: Vec<usize>, _yes: bool) -> Result<()> {
+    let mut tasks: Vec<TuiTask> = DIAGNOSTIC_TESTS
+        .iter()
+        .enumerate()
+        .map(|(index, _)| TuiTask {
+            selected: defaults.contains(&index),
+            state: DiagnosticState::Pending,
+            output: Vec::new(),
+            error: None,
+        })
+        .collect();
+    let mut cursor = 0usize;
+    let mut expanded = false;
+    let mut running = false;
+    let mut completed = false;
+    let mut started = false;
+    let mut running_index: Option<usize> = None;
+    let mut receiver: Option<std::sync::mpsc::Receiver<TuiEvent>> = None;
+    let mut worker: Option<std::thread::JoinHandle<()>> = None;
+
+    enable_raw_mode().map_err(|e| format!("enabling diagnose terminal mode: {e}"))?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen).map_err(|e| format!("opening diagnose screen: {e}"))?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend).map_err(|e| format!("creating diagnose UI: {e}"))?;
+
+    let result = (|| -> Result<()> {
+        loop {
+            while let Some(rx) = &receiver {
+                match rx.try_recv() {
+                    Ok(TuiEvent::Start(index)) => {
+                        started = true;
+                        running_index = Some(index);
+                        tasks[index].state = DiagnosticState::Running;
+                    }
+                    Ok(TuiEvent::Output(index, line)) => tasks[index].output.push(line),
+                    Ok(TuiEvent::Complete(index, error)) => {
+                        tasks[index].state = if error.is_some() {
+                            DiagnosticState::Failed
+                        } else {
+                            DiagnosticState::Passed
+                        };
+                        tasks[index].error = error;
+                        if running_index == Some(index) {
+                            running_index = None;
+                        }
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        receiver = None;
+                        running = false;
+                        completed = true;
+                        running_index = None;
+                        if let Some(handle) = worker.take() {
+                            handle
+                                .join()
+                                .map_err(|_| "diagnose worker panicked".to_string())?;
+                        }
+                        break;
+                    }
+                }
+            }
+
+            terminal
+                .draw(|frame| {
+                    draw_diagnose(
+                        frame,
+                        &tasks,
+                        DrawState {
+                            cursor,
+                            expanded,
+                            running,
+                            completed,
+                            started,
+                            running_index,
+                        },
+                    )
+                })
+                .map_err(|e| format!("drawing diagnose UI: {e}"))?;
+
+            if event::poll(Duration::from_millis(80))
+                .map_err(|e| format!("reading diagnose input: {e}"))?
+            {
+                let Event::Key(key) =
+                    event::read().map_err(|e| format!("reading diagnose key: {e}"))?
+                else {
+                    continue;
+                };
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+                match key.code {
+                    KeyCode::Char('q') | KeyCode::Esc if !running => break,
+                    KeyCode::Up if !running => cursor = cursor.saturating_sub(1),
+                    KeyCode::Down if !running => {
+                        cursor = (cursor + 1).min(tasks.len().saturating_sub(1))
+                    }
+                    KeyCode::Char(' ') if !running => {
+                        tasks[cursor].selected = !tasks[cursor].selected
+                    }
+                    KeyCode::Left | KeyCode::Right => expanded = !expanded,
+                    KeyCode::Enter if !running => {
+                        let selected: Vec<_> = tasks
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(i, task)| task.selected.then_some(i))
+                            .collect();
+                        if selected.is_empty() {
+                            continue;
+                        }
+                        for task in &mut tasks {
+                            task.state = DiagnosticState::Pending;
+                            task.output.clear();
+                            task.error = None;
+                        }
+                        let (tx, rx) = std::sync::mpsc::channel();
+                        let root = root.to_path_buf();
+                        receiver = Some(rx);
+                        running = true;
+                        let selected_for_worker = selected.clone();
+                        worker = Some(std::thread::spawn(move || {
+                            let mut failures = Vec::new();
+                            for index in selected_for_worker {
+                                let _ = tx.send(TuiEvent::Start(index));
+                                let mut log = DiagnosticLog::with_live(Some(tx.clone()))
+                                    .expect("diagnose log");
+                                log.task_index = Some(index);
+                                out::set_quiet(true);
+                                let result =
+                                    run_diagnostic_test(&root, DIAGNOSTIC_TESTS[index].0, &log);
+                                out::set_quiet(false);
+                                let error = result.err();
+                                let _ = tx.send(TuiEvent::Complete(index, error.clone()));
+                                if let Some(error) = error {
+                                    failures.push((index, error));
+                                }
+                            }
+                            let cleanup = set_mode(&root, Mode::Off);
+                            if let Err(error) = cleanup {
+                                let _ = tx.send(TuiEvent::Complete(
+                                    usize::MAX,
+                                    Some(format!("final cleanup: {error}")),
+                                ));
+                                failures.push((usize::MAX, format!("final cleanup: {error}")));
+                            }
+                            let _ = failures;
+                        }));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(())
+    })();
+
+    if let Some(handle) = worker {
+        let _ = handle.join();
+    }
+    disable_raw_mode().ok();
+    execute!(terminal.backend_mut(), LeaveAlternateScreen).ok();
+    terminal.show_cursor().ok();
+    if result.is_ok()
+        && tasks
+            .iter()
+            .any(|task| task.selected && task.state == DiagnosticState::Failed)
+    {
+        Err(String::new())
+    } else {
+        result
+    }
+}
+
+struct DrawState {
+    cursor: usize,
+    expanded: bool,
+    running: bool,
+    completed: bool,
+    started: bool,
+    running_index: Option<usize>,
+}
+
+fn draw_diagnose(frame: &mut ratatui::Frame<'_>, tasks: &[TuiTask], state: DrawState) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(4),
+            Constraint::Length(2),
+        ])
+        .split(frame.area());
+    let title = Paragraph::new(if state.completed {
+        "diagnose  ·  results shown  ←/→ details  q quit"
+    } else if state.started {
+        "diagnose  ·  running  ←/→ details  q quit"
+    } else {
+        "diagnose  ·  Space select  Enter run  ←/→ details  q quit"
+    })
+    .block(Block::default().borders(Borders::ALL).title("xvpn"));
+    frame.render_widget(title, chunks[0]);
+    let body = if state.expanded {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
+            .split(chunks[1])
+    } else {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(100), Constraint::Percentage(0)])
+            .split(chunks[1])
+    };
+    let visible: Vec<(usize, &TuiTask)> = if state.started {
+        tasks
+            .iter()
+            .enumerate()
+            .filter(|(_, task)| task.selected)
+            .collect()
+    } else {
+        tasks.iter().enumerate().collect()
+    };
+    let local_cursor = if state.started {
+        visible
+            .iter()
+            .position(|&(i, _)| i == state.cursor)
+            .unwrap_or(0)
+    } else {
+        state.cursor
+    };
+    let items: Vec<_> = visible
+        .iter()
+        .map(|(index, task)| {
+            let marker = if task.selected { "☑" } else { "☐" };
+            let status = match task.state {
+                DiagnosticState::Pending => "pending",
+                DiagnosticState::Running => {
+                    const FRAMES: [&str; 4] = ["◐ running", "◓ running", "◑ running", "◒ running"];
+                    FRAMES[(std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis()
+                        / 120) as usize
+                        % FRAMES.len()]
+                }
+                DiagnosticState::Passed => "✓ pass",
+                DiagnosticState::Failed => "✗ fail",
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!("{marker} {:02} ", index + 1),
+                    Style::default().fg(if task.selected {
+                        Color::Green
+                    } else {
+                        Color::DarkGray
+                    }),
+                ),
+                Span::raw(DIAGNOSTIC_TESTS[*index].0),
+                Span::styled(format!("  {status}"), task_style(task.state)),
+            ]))
+        })
+        .collect();
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title("checks"))
+        .highlight_style(Style::default().add_modifier(Modifier::BOLD));
+    let mut list_state = ratatui::widgets::ListState::default();
+    list_state.select(Some(local_cursor));
+    frame.render_stateful_widget(list, body[0], &mut list_state);
+    if state.expanded {
+        let focus = state
+            .running_index
+            .unwrap_or(state.cursor.min(tasks.len().saturating_sub(1)));
+        let task = &tasks[focus];
+        let lines: Vec<Line<'_>> = if task.output.is_empty() {
+            vec![Line::from("No output yet.")]
+        } else {
+            task.output.iter().map(|line| tui_log_line(line)).collect()
+        };
+        let title = if let Some(index) = state.running_index {
+            format!("live output · {}", DIAGNOSTIC_TESTS[index].0)
+        } else {
+            "live output".to_string()
+        };
+        let output = Paragraph::new(Text::from(lines))
+            .wrap(Wrap { trim: false })
+            .block(Block::default().borders(Borders::ALL).title(title));
+        frame.render_widget(output, body[1]);
+    }
+    let progress = tasks
+        .iter()
+        .filter(|t| matches!(t.state, DiagnosticState::Passed | DiagnosticState::Failed))
+        .count();
+    let total = tasks.iter().filter(|t| t.selected).count().max(1);
+    let gauge = Gauge::default()
+        .gauge_style(Style::default().fg(if state.running {
+            Color::Yellow
+        } else if state.completed {
+            if tasks
+                .iter()
+                .any(|t| t.selected && t.state == DiagnosticState::Failed)
+            {
+                Color::Red
+            } else {
+                Color::Green
+            }
+        } else {
+            Color::Green
+        }))
+        .ratio(progress as f64 / total as f64)
+        .label(format!("{progress}/{total} complete"));
+    frame.render_widget(gauge, chunks[2]);
+}
+
+fn tui_log_line(line: &str) -> Line<'_> {
+    if let Some(rest) = line.strip_prefix("COMMAND ") {
+        Line::from(vec![Span::styled(
+            format!("> {rest}"),
+            Style::default().fg(Color::Cyan),
+        )])
+    } else if let Some(rest) = line.strip_prefix("STDERR ") {
+        Line::from(vec![Span::styled(
+            format!("  {rest}"),
+            Style::default().fg(Color::Red),
+        )])
+    } else if line.starts_with("DIRECT IP ") || line.starts_with("PREFLIGHT RESULT ") {
+        Line::from(vec![Span::styled(
+            line.to_string(),
+            Style::default().fg(Color::Yellow),
+        )])
+    } else {
+        Line::from(line.to_string())
+    }
+}
+
+fn task_style(state: DiagnosticState) -> Style {
+    Style::default().fg(match state {
+        DiagnosticState::Pending => Color::DarkGray,
+        DiagnosticState::Running => Color::Yellow,
+        DiagnosticState::Passed => Color::Green,
+        DiagnosticState::Failed => Color::Red,
+    })
 }
 
 fn diagnostic_index(name: &str) -> Result<usize> {

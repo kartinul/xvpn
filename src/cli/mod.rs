@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand, ValueEnum};
 
-pub mod handlers;
+pub mod commands;
 
 use crate::{utils, vpn};
 
@@ -194,47 +194,47 @@ pub fn dispatch(cli: Cli) {
     let root = utils::root();
 
     if cli.supervise {
-        handlers::run(vpn::supervisor::supervise(&root));
+        commands::help::run(vpn::supervisor::supervise(&root));
         return;
     }
 
     let result = match cli.command {
         None => {
             if !cli.cmd.is_empty() {
-                handlers::run_app(&root, cli.index, &cli.cmd, cli.verbose)
+                commands::utils::run_app(&root, cli.index, &cli.cmd, cli.verbose)
             } else if cli.index > 0 {
-                handlers::use_profile(&root, cli.index)
+                commands::profile::use_profile(&root, cli.index)
             } else {
-                handlers::use_profile(&root, 0)
+                commands::profile::use_profile(&root, 0)
             }
         }
-        Some(Command::Set { mode }) => handlers::set_mode(&root, mode),
-        Some(Command::On) => handlers::set_mode(&root, Mode::On),
-        Some(Command::Default) => handlers::set_mode(&root, Mode::Default),
-        Some(Command::Off) => handlers::set_mode(&root, Mode::Off),
-        Some(Command::Status) => handlers::status(&root),
-        Some(Command::Apps { action, app }) => handlers::apps(&root, action, app),
-        Some(Command::Sites { action, site }) => handlers::sites(&root, action, site),
-        Some(Command::Add { app }) => handlers::add_app(&root, &app),
-        Some(Command::Remove { app }) => handlers::remove_app(&root, &app),
-        Some(Command::Profile(cmd)) => handlers::profile(&root, cmd),
-        Some(Command::Use) => handlers::use_network(&root, true, None),
+        Some(Command::Set { mode }) => commands::mode::set_mode(&root, mode),
+        Some(Command::On) => commands::mode::set_mode(&root, Mode::On),
+        Some(Command::Default) => commands::mode::set_mode(&root, Mode::Default),
+        Some(Command::Off) => commands::mode::set_mode(&root, Mode::Off),
+        Some(Command::Status) => commands::mode::status(&root),
+        Some(Command::Apps { action, app }) => commands::apps::apps(&root, action, app),
+        Some(Command::Sites { action, site }) => commands::sites::sites(&root, action, site),
+        Some(Command::Add { app }) => commands::apps::add_app(&root, &app),
+        Some(Command::Remove { app }) => commands::apps::remove_app(&root, &app),
+        Some(Command::Profile(cmd)) => commands::profile::profile(&root, cmd),
+        Some(Command::Use) => commands::network::use_network(&root, true, None),
         Some(Command::Supervise) => {
-            handlers::run(vpn::supervisor::supervise(&root));
+            commands::help::run(vpn::supervisor::supervise(&root));
             return;
         }
 
-        Some(Command::Check) => handlers::check_vpn(&root),
-        Some(Command::Logs) => handlers::logs(),
-        Some(Command::Repair) => handlers::repair(&root),
-        Some(Command::Reset) => handlers::reset(&root),
-        Some(Command::Diagnose { test, yes }) => handlers::diagnose(&root, test.as_deref(), yes),
+        Some(Command::Check) => commands::network::check_vpn(&root),
+        Some(Command::Logs) => commands::logs::logs(),
+        Some(Command::Repair) => commands::repair::repair(&root),
+        Some(Command::Reset) => commands::repair::reset(&root),
+        Some(Command::Diagnose { test, yes }) => commands::diagnose::diagnose(&root, test.as_deref(), yes),
         Some(Command::Agent { cmd }) => {
             let cmd = cmd.unwrap_or(AgentCmd::Install);
-            handlers::agent(cmd, &root)
+            commands::agent::agent(cmd, &root)
         }
-        Some(Command::Restart) => handlers::agent(AgentCmd::Restart, &root),
+        Some(Command::Restart) => commands::agent::agent(AgentCmd::Restart, &root),
     };
 
-    handlers::run(result);
+    commands::help::run(result);
 }

@@ -102,10 +102,24 @@ Run the interactive end-to-end diagnostic:
 xvpn diagnose
 ```
 
-The menu uses arrow keys to move, Space to toggle checks, and Enter to run.
+The interactive screen shows only numbered friendly task names by default.
+Use Up/Down to move, Space to toggle checks, and Enter to run the selected
+checks. Each task shows a colored pending/running/pass/fail state and a
+determinate progress bar; running tasks use a spinner-like running state and
+completed tasks show a tick. Press Left/Right on the focused task to open or
+close its detail pane. The pane contains a bounded live-output box with the
+commands and output from the running check; output stays hidden from the
+collapsed list. After all checks finish the title bar switches to
+"results shown" and the progress bar turns green or red depending on whether
+every selected check passed. Press `q` or Escape before running to quit.
+
 The default selections cover direct connectivity and both all-profile checks.
 Site, routing-mode, and Firefox checks are opt-in because they change routing
 or configuration. Every check cleans up and ends with routing off.
+
+Add `--yes` (or `-y`) to bypass the interactive menu entirely and run the
+default checks non-interactively, printing results to stdout. This makes
+`xvpn diagnose --yes` fully agent-readable.
 
 Each check can also run without the menu:
 
