@@ -1,0 +1,129 @@
+# xvpn
+
+`xvpn` is a user-space VPN manager for multiple `vless://` profiles. It runs
+xray for the proxy and sing-box for system routing, with a user supervisor that
+reconciles the selected mode every few seconds.
+
+## What the binary does
+
+The released `xvpn` binary:
+
+- detects macOS or Linux at compile time and selects the native network
+  integration;
+- stores configuration in `~/.config/xvpn` and runtime state/logs in
+  `~/.local/state/xvpn`;
+- creates and repairs its xray/sing-box configuration;
+- manages profiles, selective apps/sites, and `on`/`default`/`off` modes;
+- runs the supervisor directly with `xvpn supervise`;
+- installs the per-user supervisor agent with `xvpn agent install`;
+- requests sudo only when the active TUN routing path needs it.
+
+No `make` command is required at runtime. `install.sh` is only a convenience
+installer for building from source, installing third-party dependencies, and
+loading the user agent.
+
+## Required proxy engines
+
+The binary is not a proxy engine itself. It launches these two external
+executables:
+
+- `xray`
+- `sing-box`
+
+Install both using your operating system's package manager or trusted upstream
+release packages, and make sure both are in `PATH`. xvpn checks for them before
+starting the supervisor and reports the missing executable explicitly.
+
+This separation is intentional: silently downloading executable code from the
+internet would make a public standalone binary harder to audit and would
+create an unsafe update path.
+
+## Install from a release
+
+1. Download the binary matching your OS and CPU architecture.
+2. Make it executable and put it in a directory on `PATH`, for example:
+
+   ```sh
+   install -m 755 xvpn ~/.local/bin/xvpn
+   ```
+
+3. Install `xray` and `sing-box` as described above.
+4. Install the user supervisor:
+
+   ```sh
+   xvpn repair
+   xvpn agent install
+   ```
+
+The agent is user-scoped; it does not run xvpn as a root daemon. On macOS it
+uses a LaunchAgent. On Linux it uses a user systemd unit.
+
+## Quick start
+
+Import a profile:
+
+```sh
+xvpn import 'vless://...'
+```
+
+Select a mode:
+
+```sh
+xvpn default       # selective routing
+xvpn on            # all traffic; may request sudo for TUN
+xvpn off           # stop routing
+```
+
+Configure selective routing:
+
+```sh
+xvpn apps set Telegram
+xvpn sites set netflix.com
+```
+
+Inspect state and logs:
+
+```sh
+xvpn
+xvpn logs
+xvpn check
+```
+
+## Privilege behavior
+
+xray and Linux gateway/TProxy routing run as the current user. TUN routing may
+need root privileges. The foreground command requests authorization only for a
+transition that needs it; the background supervisor uses non-interactive sudo.
+If the sudoers rule or cached authorization is unavailable, xvpn reports the
+failure instead of claiming that routing stopped.
+
+## Building from source
+
+`make` compiles the release binary and copies it to `~/.local/bin/xvpn`:
+
+```sh
+make
+```
+
+The build artifact is also written to `target/release/xvpn`. Make sure
+`~/.local/bin` is on your shell's `PATH`; a Makefile cannot change the `PATH`
+of the shell that invoked it. The command does not install dependencies,
+modify the user agent, or change VPN state. Runtime setup is handled by xvpn
+itself.
+
+For a build without installing the binary:
+
+```sh
+cargo build --release
+./target/release/xvpn --help
+```
+
+Useful checks:
+
+```sh
+cargo test
+cargo clippy -- -D warnings
+```
+
+The project currently targets macOS and Linux. Other operating systems are
+rejected explicitly rather than falling back to an incorrect network setup.

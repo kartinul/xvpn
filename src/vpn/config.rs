@@ -1,5 +1,3 @@
-//! Paths, JSON, process IO, and xray/sing-box config generation.
-
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -16,10 +14,8 @@ pub const DEFAULT: &str = "modes/default.json";
 pub const CONF: &str = "xvpn.conf";
 pub const PROFILES: &str = "profiles";
 pub const ACTIVE: &str = "active";
-/// Profile names, one per line, in the order `profile list` numbers them.
 pub const ORDER: &str = "order";
 
-/// `$XDG_CONFIG_HOME`, or `~/.config` when unset.
 fn config_home() -> PathBuf {
     if let Some(dir) = env_var("XDG_CONFIG_HOME") {
         return dir;
@@ -27,10 +23,6 @@ fn config_home() -> PathBuf {
     home().join(".config")
 }
 
-/// `$XDG_STATE_HOME`, or `~/.local/state` when unset.
-///
-/// Runtime state lives here rather than in `/var/run` because `/var/run` is
-/// root-owned, so a user-space supervisor could not write to it.
 fn state_home() -> PathBuf {
     if let Some(dir) = env_var("XDG_STATE_HOME") {
         return dir;
@@ -70,7 +62,6 @@ fn env_var(key: &str) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// What the supervisor is currently doing, read by `xvpn` status.
 pub fn state_file() -> PathBuf {
     if let Some(p) = env_var("XVPN_STATE") {
         return p;
@@ -78,8 +69,6 @@ pub fn state_file() -> PathBuf {
     state_home().join("xvpn").join("current")
 }
 
-/// Held for the supervisor's lifetime. A second supervisor that cannot take it
-/// exits instead of reconciling the same root against the first one.
 pub fn lock_file() -> PathBuf {
     if let Some(p) = env_var("XVPN_LOCK") {
         return p;
@@ -87,22 +76,15 @@ pub fn lock_file() -> PathBuf {
     state_home().join("xvpn").join("supervisor.lock")
 }
 
-/// Per-proxy log. Under the user's state dir so a non-root supervisor can
-/// always open it; `/var/log/xvpn-*.log` was root-owned and unwritable.
 pub fn log_file(program: &str) -> PathBuf {
     state_home().join("xvpn").join(format!("{program}.log"))
 }
 
-/// Everything the tool keeps: config next to the binary's owner's dotfiles,
-/// runtime state under XDG.
-///
-/// Falls back to `~/.xvpn` when the primary root is not writable, so a
-/// read-only `~/.config` (a shared machine, a sandbox) does not strand state
-/// in a directory nobody can write to.
 pub fn root() -> PathBuf {
     if let Some(dir) = env_var("XVPN_DIR") {
         return dir;
     }
+
     let primary = config_home().join("xvpn");
     if is_writable(&primary) {
         primary
@@ -111,7 +93,10 @@ pub fn root() -> PathBuf {
     }
 }
 
-/// True when a probe file can be created in `dir`.
+pub fn home_dir() -> PathBuf {
+    home()
+}
+
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn is_writable(dir: &Path) -> bool {
     let _ = fs::create_dir_all(dir);
@@ -129,11 +114,6 @@ fn is_writable(dir: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Roots earlier versions could resolve to, kept only to explain a stale one.
-///
-/// Deliberately never `/usr/local` itself: that is a shared system directory,
-/// and treating it as an xvpn root is how state ended up in files like
-/// `/usr/local/mode` that no unprivileged command could rewrite.
 pub fn legacy_roots() -> Vec<PathBuf> {
     [
         PathBuf::from("/usr/local/etc/xvpn"),
@@ -144,11 +124,6 @@ pub fn legacy_roots() -> Vec<PathBuf> {
     .collect()
 }
 
-/// Move state into the current root, copying from the first legacy root that
-/// has any. Copies rather than moves, so the old copy survives as a fallback.
-///
-/// Only the known filenames are considered. A blanket directory copy would be
-/// catastrophic if the legacy root resolved to something like `/usr/local`.
 pub fn migrate_state() -> crate::Result<Option<PathBuf>> {
     let root = root();
     let from = legacy_roots()
@@ -163,7 +138,6 @@ pub fn migrate_state() -> crate::Result<Option<PathBuf>> {
             fs::copy(&src, root.join(name)).map_err(|e| format!("{name}: {e}"))?;
         }
     }
-    // Profiles and the generated sidecars, recursively but shallowly.
     for dir in [PROFILES, "modes"] {
         let src = from.join(dir);
         if src.is_dir() && !root.join(dir).exists() {
@@ -186,7 +160,6 @@ fn copy_tree(src: &Path, dest: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// One-time note about state left behind elsewhere. Reported, never moved.
 pub fn stale_root_notice() -> Option<String> {
     if env_var("XVPN_DIR").is_some() {
         return None;
@@ -212,13 +185,7 @@ pub fn profiles_dir(root: &Path) -> PathBuf {
     root.join(PROFILES)
 }
 
-/// Whether this process runs as root.
-///
-/// Decides whether sing-box can bring up its tun interface: on macOS there is
-/// no TProxy, so `on` mode means `auto_route`, which needs privilege.
 pub fn is_root() -> bool {
-    // SAFETY: `geteuid` takes no arguments, cannot fail, and has no
-    // preconditions.
     unsafe { libc::geteuid() == 0 }
 }
 
@@ -229,8 +196,6 @@ pub fn active_file(root: &Path) -> PathBuf {
 pub fn order_file(root: &Path) -> PathBuf {
     root.join(ORDER)
 }
-
-// json
 
 pub fn read_json(path: &Path) -> Result<Value> {
     let text = fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -243,7 +208,6 @@ pub fn write_json(path: &Path, value: &Value) -> Result<()> {
     fs::write(path, text).map_err(|e| format!("{}: {e}", path.display()))
 }
 
-// Profiles hold a bearer credential, so owner-only.
 pub fn write_secret(path: &Path, value: &Value) -> Result<()> {
     write_json(path, value)?;
     #[cfg(unix)]
@@ -254,8 +218,6 @@ pub fn write_secret(path: &Path, value: &Value) -> Result<()> {
     }
     Ok(())
 }
-
-// process
 
 pub fn argv<I, S>(values: I) -> Vec<OsString>
 where
@@ -343,9 +305,6 @@ fn pick_error(output: &str) -> Option<String> {
         .or_else(|| lines.last().cloned())
 }
 
-// vless
-
-// `http`/h2 is absent on purpose: Xray removed HTTP/2 and folded it into XHTTP.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Transport {
     Tcp,
@@ -503,8 +462,6 @@ fn url_decode(s: &str) -> String {
     out
 }
 
-// xray
-
 pub const SOCKS_PORT: u16 = 10808;
 pub const HTTP_PORT: u16 = 10809;
 pub const TPROXY_PORT: u16 = 12345;
@@ -637,8 +594,6 @@ pub fn direct_xray_config(socks_port: u16, http_port: u16) -> Value {
     })
 }
 
-// sing-box
-
 pub const PROXY_TOOLS: [&str; 6] = ["curl", "git", "brew", "ssh", "node", "python3"];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -688,7 +643,6 @@ pub fn singbox_config(scope: Scope, ingress: Ingress) -> Value {
         "route": {
             "auto_detect_interface": true,
             "find_process": true,
-            // 1.14 removed per-process DNS rule items with no replacement.
             "default_domain_resolver": "remote",
             "rules": rules,
             "final": match scope {

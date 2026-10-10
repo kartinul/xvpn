@@ -1,43 +1,26 @@
-//! What each subcommand does.
-
 use std::fs;
 use std::io::{self, Write};
 use std::net::TcpStream;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use crate::cli::{apps_args, sites_args, AppsAction, Mode, ProfileCmd, SitesAction};
-use crate::config::{self, Ingress, Scope};
-use crate::network;
-use crate::output as out;
-use crate::profiles;
-use crate::supervisor;
+use crate::cli::{AppsAction, Mode, ProfileCmd, SitesAction};
+use crate::platform::network;
+use crate::utils::output as out;
+use crate::utils::{validate_apps_args, validate_sites_args};
+use crate::vpn::config::{self, Ingress, Scope};
+use crate::vpn::profile;
+use crate::vpn::supervisor;
 use crate::{Error, Result};
 
-/// Best-effort stop of any xray/sing-box processes this user owns.
-/// Does not require the supervisor lock; called by `set_mode off` so
-/// `xvpn off` works even when no supervisor is running.
-fn stop_running_proxies() {
-    use std::process::Command;
-    // xray always runs as the user
-    let _ = Command::new("pkill").args(["-x", "xray"]).status();
-    // sing-box in `on` mode runs as root on macOS (tun needs root)
-    let _ = Command::new("pkill").args(["-x", "sing-box"]).status();
-    let _ = Command::new("sudo")
-        .args(["-n", "pkill", "-x", "sing-box"])
-        .status();
-    // Clear published state
-    let _ = std::fs::remove_file(crate::config::state_file());
-}
-
 pub fn use_profile(root: &Path, index: u16) -> Result<()> {
-    profiles::migrate_legacy(root)?;
+    profile::migrate_legacy(root)?;
     if index == 0 {
         return set_mode(root, Mode::Off);
     }
     let mode = read_mode(root);
-    let profiles = profiles::list(root);
+    let profiles = profile::list(root);
     let name = profiles
         .get(index as usize - 1)
         .map(|p| p.name.clone())
@@ -47,18 +30,16 @@ pub fn use_profile(root: &Path, index: u16) -> Result<()> {
                 profiles.len()
             )
         })?;
-    profiles::activate(root, &name)?;
+    profile::activate(root, &name)?;
     out::status("✓", &format!("active profile: {name}"));
 
-    // Quick-change: if mode is off, turn it on (default mode)
     let target_mode = if mode == "off" {
         Mode::Default
     } else {
-        // Keep current mode
         match mode.as_str() {
             "on" => Mode::On,
             "default" => Mode::Default,
-            _ => Mode::Default, // unset or unknown -> default
+            _ => Mode::Default,
         }
     };
 
@@ -101,9 +82,9 @@ pub fn status(root: &Path) -> Result<()> {
         out::warn(&notice);
     }
 
-    match profiles::active_name(root) {
+    match profile::active_name(root) {
         Some(name) => {
-            let server = profiles::list(root)
+            let server = profile::list(root)
                 .into_iter()
                 .find(|p| p.name == name)
                 .and_then(|p| p.server)
@@ -119,7 +100,6 @@ pub fn status(root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Move state out of a root an older build resolved to.
 pub fn migrate() -> Result<()> {
     match config::migrate_state()? {
         Some(from) => out::status(
@@ -172,14 +152,11 @@ fn print_routing(root: &Path) {
 
 pub fn set_mode(root: &Path, mode: Mode) -> Result<()> {
     let mode = mode.as_str();
+    supervisor::authorize_transition(root, mode)?;
     let path = root.join(config::MODE);
     fs::write(&path, mode).map_err(|e| format!("writing mode: {e}"))?;
     let written = std::time::SystemTime::now();
     out::kv("mode", mode);
-
-    if mode == "off" {
-        stop_running_proxies();
-    }
 
     if !supervisor::is_running() {
         out::warn("no supervisor is running, so nothing was applied");
@@ -204,10 +181,6 @@ pub fn set_mode(root: &Path, mode: Mode) -> Result<()> {
     Ok(())
 }
 
-/// Wait for the supervisor to republish state after `changed_at`.
-///
-/// Compares mtime rather than the value, so re-issuing the mode you are
-/// already in still reports the live state instead of timing out.
 fn wait_for_state(changed_at: std::time::SystemTime, timeout: Duration) -> Option<String> {
     let path = config::state_file();
     let deadline = Instant::now() + timeout;
@@ -232,9 +205,9 @@ fn wait_for_state(changed_at: std::time::SystemTime, timeout: Duration) -> Optio
 }
 
 pub fn import(root: &Path, link: Option<&str>, force: bool) -> Result<()> {
-    profiles::migrate_legacy(root)?;
+    profile::migrate_legacy(root)?;
     let link = read_link(link)?;
-    let name = profiles::import(root, None, &link, force)?;
+    let name = profile::import(root, None, &link, force)?;
     out::status("✓", &format!("saved profile '{name}'"));
     refresh_sidecars(root)?;
     out::status("→", "active. the supervisor will reload");
@@ -242,41 +215,41 @@ pub fn import(root: &Path, link: Option<&str>, force: bool) -> Result<()> {
 }
 
 pub fn profile(root: &Path, cmd: ProfileCmd) -> Result<()> {
-    profiles::migrate_legacy(root)?;
+    profile::migrate_legacy(root)?;
     match cmd {
         ProfileCmd::Add { name, link, force } => {
             let link = read_link(link.as_deref())?;
-            let saved = profiles::import(root, Some(&name), &link, force)?;
+            let saved = profile::import(root, Some(&name), &link, force)?;
             out::status("✓", &format!("saved profile '{saved}'"));
             refresh_sidecars(root)?;
             out::status("→", "active. the supervisor will reload");
             Ok(())
         }
-        ProfileCmd::List => profiles::print_list(root),
+        ProfileCmd::List => profile::print_list(root),
         ProfileCmd::Use { name } => {
-            let name = profiles::resolve(root, &name)?;
-            profiles::validate(root, &name)?;
-            profiles::activate(root, &name)?;
+            let name = profile::resolve(root, &name)?;
+            profile::validate(root, &name)?;
+            profile::activate(root, &name)?;
             out::status("✓", &format!("active profile: {name}"));
             refresh_sidecars(root)?;
             out::status("→", "supervisor will reload");
             Ok(())
         }
         ProfileCmd::Remove { name } => {
-            let name = profiles::resolve(root, &name)?;
-            profiles::remove(root, &name)?;
+            let name = profile::resolve(root, &name)?;
+            profile::remove(root, &name)?;
             out::status("✓", &format!("removed profile '{name}'"));
             Ok(())
         }
         ProfileCmd::Show { name } => {
             let name = match name {
-                Some(n) => profiles::resolve(root, &n)?,
-                None => match profiles::active_name(root) {
+                Some(n) => profile::resolve(root, &n)?,
+                None => match profile::active_name(root) {
                     Some(n) => n,
                     None => return Err("no profiles configured".into()),
                 },
             };
-            let cfg = config::read_json(&profiles::path_for(root, &name))?;
+            let cfg = config::read_json(&profile::path_for(root, &name))?;
             println!("{}", serde_json::to_string_pretty(&cfg).unwrap());
             Ok(())
         }
@@ -299,7 +272,7 @@ fn read_link(link: Option<&str>) -> Result<String> {
 }
 
 pub fn apps(root: &Path, action: AppsAction, app: Option<String>) -> Result<()> {
-    let (action, app) = apps_args(action, app)?;
+    let (action, app) = validate_apps_args(action, app)?;
     match (action, app) {
         (AppsAction::Show, _) => list_apps(root),
         (AppsAction::Set, Some(app)) => add_app(root, &app),
@@ -333,7 +306,7 @@ fn edit_app(root: &Path, add: bool, app: &str) -> Result<()> {
 }
 
 pub fn sites(root: &Path, action: SitesAction, site: Option<String>) -> Result<()> {
-    let (action, site) = sites_args(action, site)?;
+    let (action, site) = validate_sites_args(action, site)?;
     match (action, site) {
         (SitesAction::Show, _) => list_sites(root),
         (SitesAction::Set, Some(site)) => add_site(root, &site),
@@ -358,8 +331,6 @@ pub fn remove_site(root: &Path, site: &str) -> Result<()> {
 }
 
 fn edit_site(root: &Path, add: bool, site: &str) -> Result<()> {
-    // Echo the normalised name, so `www.` stripping is visible in the output
-    // and matches what actually landed in the config.
     let shown = network::normalize_site(site)?;
     announce_edit(
         network::edit_site(&root.join(config::DEFAULT), add, &shown),
@@ -368,7 +339,6 @@ fn edit_site(root: &Path, add: bool, site: &str) -> Result<()> {
     )
 }
 
-/// "already exists" and "not in the list" are outcomes, not failures.
 fn announce_edit(result: Result<()>, add: bool, name: &str) -> Result<()> {
     match result {
         Ok(()) => {
@@ -386,10 +356,6 @@ fn announce_edit(result: Result<()>, add: bool, name: &str) -> Result<()> {
     }
 }
 
-/// Register or forget the current network for selective mode.
-///
-/// `dns` is accepted by `forget` to drop a resolver for a network you are no
-/// longer on.
 pub fn use_network(root: &Path, add: bool, dns: Option<&str>) -> Result<()> {
     let msg = if add {
         network::register(root)?
@@ -400,15 +366,10 @@ pub fn use_network(root: &Path, add: bool, dns: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-/// Each listener paired with the scheme it actually speaks.
-///
-/// Probing the HTTP port with `socks5://` fails the handshake (curl exit 97)
-/// even when the proxy is perfectly healthy, which reads like a dead tunnel.
 const PROBES: [(&str, u16); 2] = [("socks5", config::SOCKS_PORT), ("http", config::HTTP_PORT)];
 
-/// Curl ifconfig.me through the running xray proxy to verify connectivity.
 pub fn check_vpn(root: &Path) -> Result<()> {
-    let (name, _) = profiles::resolve_active(root)?;
+    let (name, _) = profile::resolve_active(root)?;
     out::kv("checking profile", &name);
 
     for (scheme, port) in PROBES {
@@ -495,21 +456,22 @@ fn ensure_sidecar(root: &Path, name: &str, scope: Scope, ingress: Ingress) -> Re
     Ok(())
 }
 
-/// Verify that the external binaries the CLI depends on are on PATH.
 pub fn ensure_dependencies() -> Result<()> {
     for tool in ["xray", "sing-box"] {
-        let found = Command::new("which")
-            .arg(tool)
-            .output()
-            .map(|out| out.status.success())
-            .unwrap_or(false);
-        if !found {
+        if find_dependency(tool).is_none() {
             return Err(format!(
-                "{tool} not found in PATH — run `./install.sh` to install it"
+                "{tool} not found. Install {tool} and put it in PATH, then retry"
             ));
         }
     }
     Ok(())
+}
+
+fn find_dependency(tool: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(tool))
+        .find(|candidate| candidate.is_file())
 }
 
 pub fn check(root: &Path) -> Result<()> {
@@ -520,7 +482,7 @@ pub fn check(root: &Path) -> Result<()> {
     }
     let mut ok = true;
 
-    match profiles::resolve_active(root) {
+    match profile::resolve_active(root) {
         Ok((name, path)) => match config::check_xray(&path) {
             Ok(()) => out::status("✓", &format!("profile '{name}': OK")),
             Err(e) => {
@@ -561,7 +523,7 @@ pub fn repair(root: &Path) -> Result<()> {
         out::info("run ./install.sh to install missing dependencies");
         return Ok(());
     }
-    profiles::migrate_legacy(root)?;
+    profile::migrate_legacy(root)?;
     refresh_sidecars(root)?;
     out::status("✓", "configs repaired. the supervisor will reload");
     Ok(())
@@ -573,7 +535,7 @@ pub fn reset(root: &Path) -> Result<()> {
         out::info("run ./install.sh to install missing dependencies");
         return Ok(());
     }
-    profiles::migrate_legacy(root)?;
+    profile::migrate_legacy(root)?;
 
     out::section("removing configs:");
     for name in [config::XRAY, config::CONF, config::ACTIVE, config::ORDER] {
@@ -628,11 +590,6 @@ pub fn reset(root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Run an executable directly, bypassing the proxy when index is 0.
-///
-/// `xvpn 0 app args...` runs the app with no proxy at all (guaranteed).
-/// `xvpn N app args...` runs the app through profile N temporarily,
-/// using an isolated xray instance and environment variables.
 pub fn run_app(root: &Path, index: u16, trailing: &[String]) -> Result<()> {
     if trailing.is_empty() {
         return Err(
@@ -651,7 +608,7 @@ pub fn run_app(root: &Path, index: u16, trailing: &[String]) -> Result<()> {
             10813,
         )
     } else {
-        let profiles = profiles::list(root);
+        let profiles = profile::list(root);
         let profile = profiles.get(index as usize - 1).ok_or_else(|| {
             format!(
                 "no profile {index} (have {}; see `xvpn profile list`)",
@@ -700,7 +657,6 @@ pub fn run_app(root: &Path, index: u16, trailing: &[String]) -> Result<()> {
         .spawn()
         .map_err(|e| format!("could not start xray: {e}"))?;
 
-    // Wait for xray to be ready
     let mut ready = false;
     for _ in 0..50 {
         if TcpStream::connect(format!("127.0.0.1:{socks_port}")).is_ok() {
@@ -762,38 +718,119 @@ pub fn run_app(root: &Path, index: u16, trailing: &[String]) -> Result<()> {
 }
 
 pub fn agent(cmd: crate::cli::AgentCmd, _root: &Path) -> Result<()> {
+    let binary = std::env::current_exe().map_err(|e| format!("locating xvpn: {e}"))?;
     match cmd {
         crate::cli::AgentCmd::Install => {
             out::status("→", "installing and loading user agent");
-            run_make("agent")
+            install_agent(&binary)
         }
         crate::cli::AgentCmd::Stop => {
             out::status("→", "stopping supervisor and proxies");
-            run_make("stop")
+            stop_agent()
         }
         crate::cli::AgentCmd::Restart => {
             out::status("→", "restarting supervisor");
-            run_make("restart")
+            restart_agent(&binary)
         }
     }
 }
 
-fn run_make(target: &str) -> Result<()> {
-    let status = Command::new("make")
-        .arg(target)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
+fn launchctl(args: &[String]) -> Result<()> {
+    let status = Command::new("launchctl")
+        .args(args)
         .status()
-        .map_err(|e| format!("make {target} failed: {e}"))?;
-
+        .map_err(|e| format!("launchctl failed: {e}"))?;
     if !status.success() {
-        return Err(format!("make {target} exited with {status}"));
+        return Err(format!("launchctl exited with {status}"));
     }
     Ok(())
 }
 
-/// Spawns `tail -f` to watch supervisor, xray and sing-box logs.
+fn install_agent(binary: &Path) -> Result<()> {
+    match network::os() {
+        network::Os::MacOs => {
+            let dir = config::home_dir().join("Library/LaunchAgents");
+            fs::create_dir_all(&dir).map_err(|e| format!("creating LaunchAgents: {e}"))?;
+            let plist = dir.join("com.xvpn.plist");
+            let log = config::log_file("supervisor");
+            let content = format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \
+\"http://www.apple.com/DTDs/PropertyList-1.0.dtd\"><plist version=\"1.0\"><dict>\
+<key>Label</key><string>com.xvpn</string><key>ProgramArguments</key><array>\
+<string>{}</string><string>--supervise</string></array><key>RunAtLoad</key><true/>\
+<key>KeepAlive</key><true/><key>StandardOutPath</key><string>{}</string>\
+<key>StandardErrorPath</key><string>{}</string></dict></plist>",
+                binary.display(),
+                log.display(),
+                log.display()
+            );
+            fs::write(&plist, content).map_err(|e| format!("writing agent: {e}"))?;
+            let id = format!("gui/{}/com.xvpn", unsafe { libc::getuid() });
+            let _ = launchctl(&["bootout".into(), id.clone()]);
+            launchctl(&[
+                "bootstrap".into(),
+                format!("gui/{}", unsafe { libc::getuid() }),
+                plist.display().to_string(),
+            ])?;
+            launchctl(&["enable".into(), id])?;
+        }
+        network::Os::Linux => {
+            let dir = config::home_dir().join(".config/systemd/user");
+            fs::create_dir_all(&dir).map_err(|e| format!("creating systemd user dir: {e}"))?;
+            let unit = dir.join("xvpn.service");
+            let content = format!(
+                "[Unit]\nDescription=xvpn supervisor\nAfter=network-online.target\n\
+Wants=network-online.target\n\n[Service]\nType=simple\nExecStart={} --supervise\n\
+Restart=always\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n",
+                binary.display()
+            );
+            fs::write(&unit, content).map_err(|e| format!("writing systemd unit: {e}"))?;
+            command_ok("systemctl", &["--user", "daemon-reload"])?;
+            command_ok("systemctl", &["--user", "enable", "--now", "xvpn.service"])?;
+        }
+    }
+    Ok(())
+}
+
+fn stop_agent() -> Result<()> {
+    match network::os() {
+        network::Os::MacOs => {
+            let id = format!("gui/{}/com.xvpn", unsafe { libc::getuid() });
+            let _ = launchctl(&["bootout".into(), id]);
+        }
+        network::Os::Linux => {
+            command_ok("systemctl", &["--user", "disable", "--now", "xvpn.service"])?;
+        }
+    }
+    Ok(())
+}
+
+fn restart_agent(binary: &Path) -> Result<()> {
+    match network::os() {
+        network::Os::MacOs => {
+            let id = format!("gui/{}/com.xvpn", unsafe { libc::getuid() });
+            launchctl(&["kickstart".into(), "-k".into(), id])
+        }
+        network::Os::Linux => {
+            install_agent(binary)?;
+            command_ok("systemctl", &["--user", "restart", "xvpn.service"])
+        }
+    }
+}
+
+fn command_ok(program: &str, args: &[&str]) -> Result<()> {
+    let status = Command::new(program)
+        .args(args)
+        .status()
+        .map_err(|e| format!("{program} failed: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("{program} exited with {status}"))
+    }
+}
+
 pub fn logs() -> Result<()> {
     let logs = [
         config::log_file("xray"),
@@ -802,7 +839,6 @@ pub fn logs() -> Result<()> {
     ];
     let mut args = vec!["-f".to_string()];
     for log in &logs {
-        // Create files if they don't exist so tail doesn't complain
         if let Some(parent) = log.parent() {
             let _ = fs::create_dir_all(parent);
         }

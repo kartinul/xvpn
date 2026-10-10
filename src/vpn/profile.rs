@@ -1,12 +1,11 @@
-//! Named vless configs and which one is active.
-
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use crate::config::{self, read_json, write_secret};
-use crate::output as out;
+use super::config;
+use crate::utils::output as out;
+use crate::utils::{read_json, write_secret};
 use crate::Result;
 
 #[derive(Clone, Debug)]
@@ -49,20 +48,13 @@ pub fn validate_name(name: &str) -> Result<()> {
 }
 
 pub fn path_for(root: &Path, name: &str) -> PathBuf {
-    config::profiles_dir(root).join(format!("{name}.json"))
+    crate::utils::profiles_dir(root).join(format!("{name}.json"))
 }
 
 pub fn exists(root: &Path, name: &str) -> bool {
     path_for(root, name).is_file()
 }
 
-/// Profiles in display order.
-///
-/// The order lives in the `order` file, one name per line, so it does not move
-/// when a profile is rewritten. Names absent from the file are appended in
-/// alphabetical order, which keeps a hand-dropped profile visible; names in the
-/// file with no profile behind them are dropped, so a stale line cannot block
-/// the positions after it.
 pub fn list(root: &Path) -> Vec<Profile> {
     let on_disk = disk_names(root);
     if on_disk.is_empty() {
@@ -71,8 +63,6 @@ pub fn list(root: &Path) -> Vec<Profile> {
 
     let recorded = read_order(root);
     let seeding = recorded.is_empty();
-    // read_order already drops duplicates and blanks, so the only filtering
-    // left is dropping names whose profile is gone.
     let mut ordered: Vec<String> = recorded
         .iter()
         .filter(|n| on_disk.contains(n))
@@ -86,7 +76,6 @@ pub fn list(root: &Path) -> Vec<Profile> {
     missing.sort();
     ordered.extend(missing);
 
-    // Seed the file on first use so the order is explicit from then on.
     if seeding {
         let _ = write_order(root, &ordered);
     }
@@ -104,9 +93,8 @@ pub fn list(root: &Path) -> Vec<Profile> {
         .collect()
 }
 
-/// Profile names present in `profiles/`.
 fn disk_names(root: &Path) -> Vec<String> {
-    let Ok(entries) = fs::read_dir(config::profiles_dir(root)) else {
+    let Ok(entries) = fs::read_dir(crate::utils::profiles_dir(root)) else {
         return Vec::new();
     };
     entries
@@ -121,9 +109,8 @@ fn disk_names(root: &Path) -> Vec<String> {
         .collect()
 }
 
-/// The recorded order, empty when there is no file.
 pub fn read_order(root: &Path) -> Vec<String> {
-    let Ok(content) = fs::read_to_string(config::order_file(root)) else {
+    let Ok(content) = fs::read_to_string(crate::utils::order_file(root)) else {
         return Vec::new();
     };
     let mut names: Vec<String> = Vec::new();
@@ -142,10 +129,9 @@ fn write_order(root: &Path, names: &[String]) -> Result<()> {
     } else {
         format!("{}\n", names.join("\n"))
     };
-    fs::write(config::order_file(root), content).map_err(|e| format!("order: {e}"))
+    fs::write(crate::utils::order_file(root), content).map_err(|e| format!("order: {e}"))
 }
 
-/// Record `name`, keeping an existing position so `--force` does not move it.
 fn record(root: &Path, name: &str) -> Result<()> {
     let mut names = read_order(root);
     if !names.iter().any(|n| n == name) {
@@ -154,20 +140,11 @@ fn record(root: &Path, name: &str) -> Result<()> {
     write_order(root, &names)
 }
 
-/// Forget `name`, so removing a profile does not leave a stale line.
 fn forget(root: &Path, name: &str) -> Result<()> {
     let names: Vec<String> = read_order(root).into_iter().filter(|n| n != name).collect();
     write_order(root, &names)
 }
 
-/// Resolve a profile reference to its name.
-///
-/// A reference is a name or a `1`-based position, where positions come from the
-/// `order` file. An exact name match wins over a position, so a profile
-/// actually named `1` stays reachable.
-///
-/// Positions shift when profiles are added or removed, which is why a name is
-/// the better thing to script with.
 pub fn resolve(root: &Path, reference: &str) -> Result<String> {
     if exists(root, reference) {
         return Ok(reference.to_string());
@@ -184,7 +161,6 @@ pub fn resolve(root: &Path, reference: &str) -> Result<String> {
                 )
             });
     }
-    // A bare number past the end is far more likely a typo in a name.
     Err(format!(
         "no such profile: {reference}\n\
          hint: use the name, or its position from `xvpn profile list`"
@@ -192,13 +168,13 @@ pub fn resolve(root: &Path, reference: &str) -> Result<String> {
 }
 
 pub fn active_name(root: &Path) -> Option<String> {
-    let name = fs::read_to_string(config::active_file(root)).ok()?;
+    let name = fs::read_to_string(crate::utils::active_file(root)).ok()?;
     let name = name.trim().to_string();
     (!name.is_empty()).then_some(name)
 }
 
 fn ensure_profiles_dir(root: &Path) -> Result<()> {
-    fs::create_dir_all(config::profiles_dir(root))
+    fs::create_dir_all(crate::utils::profiles_dir(root))
         .map_err(|e| format!("creating profiles dir: {e}"))
 }
 
@@ -207,11 +183,9 @@ fn store(root: &Path, name: &str, config: &Value) -> Result<()> {
     write_secret(&path_for(root, name), config)
 }
 
-// Validates on a temp file first, so a bad link cannot leave a broken profile
-// behind. The `.json` suffix matters: xray picks its parser from the extension.
 fn store_checked(root: &Path, name: &str, config: &Value) -> Result<()> {
     ensure_profiles_dir(root)?;
-    let tmp = config::profiles_dir(root).join(format!(".tmp-{name}.json"));
+    let tmp = crate::utils::profiles_dir(root).join(format!(".tmp-{name}.json"));
     write_secret(&tmp, config)?;
     if let Err(e) = config::check_xray(&tmp) {
         let _ = fs::remove_file(&tmp);
@@ -221,18 +195,16 @@ fn store_checked(root: &Path, name: &str, config: &Value) -> Result<()> {
         .map_err(|e| format!("{}: {e}", path_for(root, name).display()))
 }
 
-/// Point `active` at `reference`, which may be a name or a `1`-based position.
 pub fn activate(root: &Path, reference: &str) -> Result<()> {
     let name = resolve(root, reference)?;
     if !exists(root, &name) {
         return Err(format!("no such profile: {name}"));
     }
-    fs::write(config::active_file(root), format!("{name}\n"))
+    fs::write(crate::utils::active_file(root), format!("{name}\n"))
         .map_err(|e| format!("writing active profile: {e}"))?;
     materialize(root)
 }
 
-// xray.json stays as a copy so the supervisor has one obvious file to read.
 fn materialize(root: &Path) -> Result<()> {
     let name = active_name(root).ok_or("no active profile (run `xvpn profile list`)")?;
     let cfg = read_json(&path_for(root, &name))?;
@@ -282,7 +254,7 @@ pub fn remove(root: &Path, name: &str) -> Result<()> {
         match list(root).first() {
             Some(next) => activate(root, &next.name)?,
             None => {
-                fs::remove_file(config::active_file(root)).ok();
+                fs::remove_file(crate::utils::active_file(root)).ok();
                 fs::remove_file(root.join(config::XRAY)).ok();
             }
         }
@@ -290,10 +262,8 @@ pub fn remove(root: &Path, name: &str) -> Result<()> {
     Ok(())
 }
 
-// Only when profiles/ is absent: activate keeps writing xray.json, so keying
-// this on that file alone would migrate on every command.
 pub fn migrate_legacy(root: &Path) -> Result<Option<String>> {
-    if config::profiles_dir(root).is_dir() || exists(root, "default") {
+    if crate::utils::profiles_dir(root).is_dir() || exists(root, "default") {
         return Ok(None);
     }
     let legacy = root.join(config::XRAY);
@@ -330,8 +300,6 @@ pub fn import(root: &Path, name: Option<&str>, link: &str, force: bool) -> Resul
         ));
     }
     store_checked(root, &name, &cfg)?;
-    // After storing: `activate` resolves through `list`, so recording first is
-    // what puts a brand-new profile in the order at all.
     record(root, &name)?;
     activate(root, &name)?;
     Ok(name)
@@ -361,10 +329,8 @@ pub fn print_list(root: &Path) -> Result<()> {
         return Ok(());
     }
 
-    // Prepare data for the table
     let header = ["", "ID", "name", "server"];
 
-    // We need to store the owned strings so they live long enough for the table call
     let mut storage: Vec<Vec<String>> = Vec::new();
     storage.push(header.iter().map(|s| s.to_string()).collect());
 

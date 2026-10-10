@@ -100,7 +100,7 @@ installed on $OS, as the current user (no root daemon).
   xvpn logs                    tail the supervisor and proxy logs
   xvpn --help                  everything else
 
-Full-system routing in 'on' mode needs root for sing-box's tun interface. Run
-'sudo -v' once; the supervisor then reuses that cached grant instead of
-prompting, since a background agent cannot answer a password prompt.
+Full-system routing in 'on' mode needs root for sing-box's tun interface. xvpn
+will ask for sudo authorization only when a tun transition needs it; the
+background supervisor then reuses that cached grant instead of prompting.
 EOF
