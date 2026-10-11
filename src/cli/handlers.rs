@@ -22,7 +22,7 @@ use ratatui::{
 use crate::cli::{AppsAction, Mode, ProfileCmd, SitesAction};
 use crate::platform::network;
 use crate::utils::output as out;
-use crate::utils::{validate_apps_args, validate_sites_args};
+use crate::utils::{validate_apps_args, validate_sites_args, read_json, write_json};
 use crate::vpn::config::{self, Ingress, Scope};
 use crate::vpn::profile;
 use crate::vpn::supervisor;
@@ -134,7 +134,7 @@ pub fn migrate() -> Result<()> {
 
 fn print_routing(root: &Path) {
     let path = root.join(config::DEFAULT);
-    let cfg = match config::read_json(&path) {
+    let cfg = match read_json(&path) {
         Ok(c) => c,
         Err(_) => {
             out::kv("routed", "unknown (run `xvpn repair`)");
@@ -255,7 +255,7 @@ pub fn profile(root: &Path, cmd: ProfileCmd) -> Result<()> {
                     None => return Err("no profiles configured".into()),
                 },
             };
-            let cfg = config::read_json(&profile::path_for(root, &name))?;
+            let cfg = read_json(&profile::path_for(root, &name))?;
             println!("{}", serde_json::to_string_pretty(&cfg).unwrap());
             Ok(())
         }
@@ -454,7 +454,7 @@ fn ensure_sidecar(root: &Path, name: &str, scope: Scope, ingress: Ingress) -> Re
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("{name}: {e}"))?;
     }
-    let action = match config::read_json(&path) {
+    let action = match read_json(&path) {
         Ok(existing) => {
             let fresh = config::migrate_singbox(&existing, scope, ingress);
             if fresh == existing {
@@ -462,11 +462,11 @@ fn ensure_sidecar(root: &Path, name: &str, scope: Scope, ingress: Ingress) -> Re
                 out::status("→", &format!("{name}: already current"));
                 return Ok(());
             }
-            config::write_json(&path, &fresh)?;
+            write_json(&path, &fresh)?;
             "migrated"
         }
         Err(_) => {
-            config::write_json(&path, &config::singbox_config(scope, ingress))?;
+            write_json(&path, &config::singbox_config(scope, ingress))?;
             "created"
         }
     };
@@ -1630,7 +1630,7 @@ pub fn reset(root: &Path) -> Result<()> {
     out::section("recreating configs:");
     for (name, scope) in sidecars() {
         let path = root.join(name);
-        if let Err(e) = config::write_json(&path, &config::singbox_config(scope, ingress)) {
+        if let Err(e) = write_json(&path, &config::singbox_config(scope, ingress)) {
             failures.push(format!("{name}: {e}"));
             continue;
         }
@@ -1686,7 +1686,7 @@ pub fn run_app(root: &Path, index: u16, trailing: &[String], verbose: bool) -> R
                 profiles.len()
             )
         })?;
-        let mut cfg = config::read_json(&profile.path)?;
+        let mut cfg = read_json(&profile.path)?;
         let socks_port = 10810;
         let http_port = 10811;
 
@@ -1706,7 +1706,7 @@ pub fn run_app(root: &Path, index: u16, trailing: &[String], verbose: bool) -> R
     let _ = fs::create_dir_all(&tmp_dir);
     let tmp_id = format!("{}-{}", std::process::id(), index);
     let tmp_path = tmp_dir.join(format!("xray-isolated-{}.json", tmp_id));
-    config::write_json(&tmp_path, &cfg)?;
+    write_json(&tmp_path, &cfg)?;
 
     if verbose {
         if index > 0 {

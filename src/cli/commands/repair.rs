@@ -5,6 +5,7 @@ use std::path::Path;
 use crate::cli::commands::utils::{ensure_dependencies, ingress, refresh_sidecars, sidecars};
 use crate::platform::network;
 use crate::utils::output as out;
+use crate::utils::write_json;
 use crate::vpn::config::{self};
 use crate::vpn::profile;
 use crate::{Error, Result};
@@ -51,7 +52,7 @@ pub fn reset(root: &Path) -> Result<()> {
     out::section("recreating configs:");
     for (name, scope) in sidecars() {
         let path = root.join(name);
-        if let Err(e) = config::write_json(&path, &config::singbox_config(scope, ingress)) {
+        if let Err(e) = write_json(&path, &config::singbox_config(scope, ingress)) {
             failures.push(format!("{name}: {e}"));
             continue;
         }

@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use crate::cli::Mode;
 use crate::platform::network;
 use crate::utils::output as out;
+use crate::utils::read_json;
 use crate::vpn::config::{self};
 use crate::vpn::profile;
 use crate::vpn::supervisor;
@@ -101,7 +102,7 @@ pub fn read_mode(root: &Path) -> String {
 
 fn print_routing(root: &Path) {
     let path = root.join(config::DEFAULT);
-    let cfg = match config::read_json(&path) {
+    let cfg = match read_json(&path) {
         Ok(c) => c,
         Err(_) => {
             out::kv("routed", "unknown (run `xvpn repair`)");

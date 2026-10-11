@@ -1,8 +1,8 @@
 use clap::{Parser, Subcommand, ValueEnum};
 
-pub mod commands;
-
 use crate::{utils, vpn};
+
+pub mod commands;
 
 #[derive(Parser)]
 #[command(name = "xvpn", version, about = "xray VPN manager")]

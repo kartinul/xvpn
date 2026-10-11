@@ -5,7 +5,7 @@ use crate::cli::{Mode, ProfileCmd};
 use crate::cli::commands::mode::{read_mode, set_mode};
 use crate::cli::commands::utils::refresh_sidecars;
 use crate::utils::output as out;
-use crate::vpn::config::{self};
+use crate::utils::read_json;
 use crate::vpn::profile;
 use crate::vpn::supervisor;
 use crate::Result;
@@ -97,7 +97,7 @@ pub fn profile(root: &Path, cmd: ProfileCmd) -> Result<()> {
                     None => return Err("no profiles configured".into()),
                 },
             };
-            let cfg = config::read_json(&profile::path_for(root, &name))?;
+            let cfg = read_json(&profile::path_for(root, &name))?;
             println!("{}", serde_json::to_string_pretty(&cfg).unwrap());
             Ok(())
         }

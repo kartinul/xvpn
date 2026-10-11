@@ -5,6 +5,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use crate::utils::output as out;
+use crate::utils::{read_json, write_json};
 use crate::vpn::config::{self};
 use crate::vpn::profile;
 use crate::Result;
@@ -98,7 +99,7 @@ fn ensure_sidecar(root: &Path, name: &str, scope: config::Scope, ingress: config
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("{name}: {e}"))?;
     }
-    let action = match config::read_json(&path) {
+    let action = match read_json(&path) {
         Ok(existing) => {
             let fresh = config::migrate_singbox(&existing, scope, ingress);
             if fresh == existing {
@@ -106,11 +107,11 @@ fn ensure_sidecar(root: &Path, name: &str, scope: config::Scope, ingress: config
                 out::status("→", &format!("{name}: already current"));
                 return Ok(());
             }
-            config::write_json(&path, &fresh)?;
+            write_json(&path, &fresh)?;
             "migrated"
         }
         Err(_) => {
-            config::write_json(&path, &config::singbox_config(scope, ingress))?;
+            write_json(&path, &config::singbox_config(scope, ingress))?;
             "created"
         }
     };
@@ -143,7 +144,7 @@ pub fn run_app(root: &Path, index: u16, trailing: &[String], verbose: bool) -> R
                 profiles.len()
             )
         })?;
-        let mut cfg = config::read_json(&profile.path)?;
+        let mut cfg = read_json(&profile.path)?;
         let socks_port = 10810;
         let http_port = 10811;
 
@@ -163,7 +164,7 @@ pub fn run_app(root: &Path, index: u16, trailing: &[String], verbose: bool) -> R
     let _ = fs::create_dir_all(&tmp_dir);
     let tmp_id = format!("{}-{}", std::process::id(), index);
     let tmp_path = tmp_dir.join(format!("xray-isolated-{}.json", tmp_id));
-    config::write_json(&tmp_path, &cfg)?;
+    write_json(&tmp_path, &cfg)?;
 
     if verbose {
         if index > 0 {
