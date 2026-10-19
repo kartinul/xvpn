@@ -11,9 +11,9 @@ pub struct Cli {
     #[arg(short = 'v', long, global = true)]
     pub verbose: bool,
 
-    /// Index into the profile list (0 = off, 1 = first profile, etc.)
-    #[arg(value_parser, default_value_t = 0)]
-    pub index: u16,
+    /// Index into the profile list (0 = off, 1 = first profile, etc.); omit for status
+    #[arg(value_parser)]
+    pub index: Option<u16>,
 
     /// Command to run with its arguments (everything after the index)
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -208,11 +208,11 @@ pub fn dispatch(cli: Cli) {
     let result = match cli.command {
         None => {
             if !cli.cmd.is_empty() {
-                commands::utils::run_app(&root, cli.index, &cli.cmd, cli.verbose)
-            } else if cli.index > 0 {
-                commands::profile::use_profile(&root, cli.index)
+                commands::utils::run_app(&root, cli.index.unwrap_or(0), &cli.cmd, cli.verbose)
+            } else if let Some(index) = cli.index {
+                commands::profile::use_profile(&root, index)
             } else {
-                commands::profile::use_profile(&root, 0)
+                commands::mode::status(&root)
             }
         }
         Some(Command::Set { mode }) => commands::mode::set_mode(&root, mode),
