@@ -29,6 +29,18 @@ pub fn reset(root: &Path) -> Result<()> {
         return Ok(());
     }
     profile::migrate_legacy(root)?;
+    let prompt = format!(
+        "delete every profile and generated config in {}?",
+        root.display()
+    );
+    let confirmed = dialoguer::Confirm::new()
+        .with_prompt(prompt)
+        .default(false)
+        .interact()
+        .unwrap_or(false);
+    if !confirmed {
+        return Err("reset cancelled, nothing deleted".into());
+    }
 
     out::section("removing configs:");
     for name in [config::XRAY, config::CONF, config::ACTIVE, config::ORDER] {
