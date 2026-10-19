@@ -81,7 +81,7 @@ fn install_agent(binary: &Path) -> Result<()> {
                 log.display()
             );
             fs::write(&plist, content).map_err(|e| format!("writing agent: {e}"))?;
-            install_root_setup()?;
+            install_root_setup(binary)?;
             let id = format!("gui/{}/com.xvpn", unsafe { libc::getuid() });
             launchctl_bootout(&id)?;
             // bootout returns before launchd finishes unloading; bootstrap too early fails with EIO
@@ -119,13 +119,20 @@ Restart=always\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n",
 
 fn sudoers_rule(user: &str) -> String {
     let pattern = supervisor::root_pattern();
+    let xvpn = config::ROOT_XVPN;
     format!(
-        "{user} ALL=(root) NOPASSWD: {} run -c {}\n\
+        "{user} ALL=(root) NOPASSWD: {xvpn} root-run on\n\
+         {user} ALL=(root) NOPASSWD: {xvpn} root-run default\n\
          {user} ALL=(root) NOPASSWD: /usr/bin/pkill -TERM -f {pattern}\n\
-         {user} ALL=(root) NOPASSWD: /usr/bin/pkill -KILL -f {pattern}\n",
-        config::ROOT_SING_BOX,
-        config::ROOT_ON
+         {user} ALL=(root) NOPASSWD: /usr/bin/pkill -KILL -f {pattern}\n"
     )
+}
+
+fn sudo_install(source: &str, target: &str) -> Result<()> {
+    let args = [
+        "install", "-m", "755", "-o", "root", "-g", "wheel", source, target,
+    ];
+    command_ok("sudo", &args)
 }
 
 fn sudo_write(path: &str, content: &str) -> Result<()> {
@@ -150,7 +157,7 @@ fn sudo_write(path: &str, content: &str) -> Result<()> {
 
 // launchd agents have no tty, so they can't reuse a terminal's sudo ticket;
 // root only ever runs root-owned copies, never files the user can edit
-fn install_root_setup() -> Result<()> {
+fn install_root_setup(binary: &Path) -> Result<()> {
     let user = std::env::var("USER").map_err(|_| "USER is not set".to_string())?;
     let sing_box = Command::new("which")
         .arg("sing-box")
@@ -163,43 +170,22 @@ fn install_root_setup() -> Result<()> {
         .map_err(|e| format!("{sing_box}: {e}"))?
         .display()
         .to_string();
-    let on_json = serde_json::to_string_pretty(&config::singbox_config(
-        config::Scope::Global,
-        config::Ingress::Tun,
-    ))
-    .map_err(|e| format!("rendering on.json: {e}"))?;
-    let dir = Path::new(config::ROOT_ON)
-        .parent()
-        .ok_or("bad ROOT_ON")?
-        .display()
-        .to_string();
     let draft = "/etc/sudoers.d/xvpn.new"; // sudo skips includedir files with a dot
 
     out::status(
         "→",
-        "installing root-owned sing-box and sudo rule (asks for sudo once)",
+        "installing root-owned xvpn + sing-box and sudo rule (asks for sudo once)",
     );
+    let dir = config::ROOT_DIR;
     command_ok(
         "sudo",
         &[
-            "install", "-d", "-m", "755", "-o", "root", "-g", "wheel", &dir,
+            "install", "-d", "-m", "755", "-o", "root", "-g", "wheel", dir,
         ],
     )?;
-    command_ok(
-        "sudo",
-        &[
-            "install",
-            "-m",
-            "755",
-            "-o",
-            "root",
-            "-g",
-            "wheel",
-            &sing_box,
-            config::ROOT_SING_BOX,
-        ],
-    )?;
-    sudo_write(config::ROOT_ON, &on_json)?;
+    sudo_install(&sing_box, config::ROOT_SING_BOX)?;
+    sudo_install(&binary.display().to_string(), config::ROOT_XVPN)?;
+    let _ = command_ok("sudo", &["rm", "-f", &format!("{dir}/on.json")]);
     sudo_write(draft, &sudoers_rule(&user))?;
     if let Err(e) = command_ok("sudo", &["visudo", "-cf", draft]) {
         let _ = command_ok("sudo", &["rm", "-f", draft]);
@@ -272,12 +258,15 @@ mod tests {
 
     #[test]
     fn sudoers_rule_pins_root_owned_files() {
-        let rule = sudoers_rule("me");
+        let pattern = "^/usr/local/libexec/xvpn/sing-box run -c /usr/local/libexec/xvpn/run.json";
         assert_eq!(
-            rule,
-            "me ALL=(root) NOPASSWD: /usr/local/libexec/xvpn/sing-box run -c /usr/local/libexec/xvpn/on.json\n\
-             me ALL=(root) NOPASSWD: /usr/bin/pkill -TERM -f ^/usr/local/libexec/xvpn/sing-box run -c /usr/local/libexec/xvpn/on.json\n\
-             me ALL=(root) NOPASSWD: /usr/bin/pkill -KILL -f ^/usr/local/libexec/xvpn/sing-box run -c /usr/local/libexec/xvpn/on.json\n"
+            sudoers_rule("me"),
+            format!(
+                "me ALL=(root) NOPASSWD: /usr/local/libexec/xvpn/xvpn root-run on\n\
+                 me ALL=(root) NOPASSWD: /usr/local/libexec/xvpn/xvpn root-run default\n\
+                 me ALL=(root) NOPASSWD: /usr/bin/pkill -TERM -f {pattern}\n\
+                 me ALL=(root) NOPASSWD: /usr/bin/pkill -KILL -f {pattern}\n"
+            )
         );
     }
 }

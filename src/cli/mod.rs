@@ -76,6 +76,9 @@ pub enum Command {
     /// Run the supervisor in the foreground
     #[command(hide = true)]
     Supervise,
+    /// Root-side tun runner, started by the supervisor through sudo
+    #[command(hide = true)]
+    RootRun { mode: String },
 
     /// Curl ifconfig.me through the running xray proxy
     Check,
@@ -191,6 +194,10 @@ pub enum ProfileCmd {
 }
 
 pub fn dispatch(cli: Cli) {
+    if let Some(Command::RootRun { mode }) = &cli.command {
+        commands::help::run(vpn::supervisor::root_run(mode));
+        return;
+    }
     let root = utils::root();
 
     if cli.supervise {
@@ -219,6 +226,7 @@ pub fn dispatch(cli: Cli) {
         Some(Command::Remove { app }) => commands::apps::remove_app(&root, &app),
         Some(Command::Profile(cmd)) => commands::profile::profile(&root, cmd),
         Some(Command::Use) => commands::network::use_network(&root, true, None),
+        Some(Command::RootRun { .. }) => unreachable!("handled before root()"),
         Some(Command::Supervise) => {
             commands::help::run(vpn::supervisor::supervise(&root));
             return;

@@ -16,14 +16,21 @@ pub const PROFILES: &str = "profiles";
 pub const ACTIVE: &str = "active";
 pub const ORDER: &str = "order";
 // root-owned copies so nothing the user can edit ever runs as root
+pub const ROOT_DIR: &str = "/usr/local/libexec/xvpn";
+pub const ROOT_XVPN: &str = "/usr/local/libexec/xvpn/xvpn";
 pub const ROOT_SING_BOX: &str = "/usr/local/libexec/xvpn/sing-box";
-pub const ROOT_ON: &str = "/usr/local/libexec/xvpn/on.json";
+pub const ROOT_RUN: &str = "/usr/local/libexec/xvpn/run.json";
 
 fn config_home() -> PathBuf {
     if let Some(dir) = env_var("XDG_CONFIG_HOME") {
         return dir;
     }
     home().join(".config")
+}
+
+// shortcut: ignores the ~/.xvpn fallback root, upgrade if that fallback is ever used on macOS
+pub fn user_default_json() -> PathBuf {
+    config_home().join("xvpn").join(DEFAULT)
 }
 
 fn state_home() -> PathBuf {
@@ -621,6 +628,34 @@ fn is_user_rule(rule: &Value) -> bool {
     rule.get("process_path_regex").is_some() || rule.get("domain_suffix").is_some()
 }
 
+// only plain site/app rules may cross into the config root runs
+pub fn sanitized_user_rules(config: &Value) -> Vec<Value> {
+    let rules = config.pointer("/route/rules").and_then(Value::as_array);
+    rules
+        .into_iter()
+        .flatten()
+        .filter_map(|rule| {
+            let rule = rule.as_object()?;
+            if rule.len() != 2 || rule.get("outbound")? != "xray" {
+                return None;
+            }
+            let (key, values) = rule.iter().find(|(key, _)| *key != "outbound")?;
+            if key != "domain_suffix" && key != "process_path_regex" {
+                return None;
+            }
+            let values: Vec<&str> = values
+                .as_array()?
+                .iter()
+                .map(Value::as_str)
+                .collect::<Option<_>>()?;
+            let mut clean = serde_json::Map::new();
+            clean.insert(key.clone(), json!(values));
+            clean.insert("outbound".into(), json!("xray"));
+            Some(Value::Object(clean))
+        })
+        .collect()
+}
+
 pub fn migrate_singbox(existing: &Value, scope: Scope, ingress: Ingress) -> Value {
     let mut fresh = singbox_config(scope, ingress);
     let carried: Vec<Value> = existing
@@ -645,4 +680,31 @@ pub fn check_singbox(path: &Path) -> Result<()> {
         &argv(["check".as_ref(), "-c".as_ref(), path.as_os_str()]),
     )
     .map_err(|e| format!("sing-box rejected {}: {e}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_plain_site_and_app_rules_reach_root() {
+        let user = json!({
+            "log": { "output": "/etc/sudoers" },
+            "route": { "rules": [
+                { "process_name": ["xray"], "outbound": "direct" },
+                { "domain_suffix": ["ip.me"], "outbound": "xray" },
+                { "process_path_regex": [".*/Firefox\\.app/.*"], "outbound": "xray" },
+                { "domain_suffix": ["evil.com"], "outbound": "direct" },
+                { "domain_suffix": ["x.com"], "outbound": "xray", "rule_set": ["/etc/x"] },
+                { "domain_suffix": [1], "outbound": "xray" },
+            ]}
+        });
+        assert_eq!(
+            sanitized_user_rules(&user),
+            vec![
+                json!({ "domain_suffix": ["ip.me"], "outbound": "xray" }),
+                json!({ "process_path_regex": [".*/Firefox\\.app/.*"], "outbound": "xray" }),
+            ]
+        );
+    }
 }

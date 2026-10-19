@@ -232,7 +232,7 @@ fn mode_needs_root(root: &Path, mode: &str) -> bool {
 
 // anchored so it never matches the `sudo ...` wrappers around sing-box or pkill
 pub fn root_pattern() -> String {
-    format!("^{} run -c {}", config::ROOT_SING_BOX, config::ROOT_ON)
+    format!("^{} run -c {}", config::ROOT_SING_BOX, config::ROOT_RUN)
 }
 
 fn sudo_ok(args: &[&str]) -> bool {
@@ -248,11 +248,41 @@ fn sudo_ok(args: &[&str]) -> bool {
 }
 
 fn root_allowed() -> bool {
-    let current = fs::read_to_string(config::ROOT_ON)
-        .ok()
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-        == Some(config::singbox_config(config::Scope::Global, Ingress::Tun));
-    current && sudo_ok(&["-l", config::ROOT_SING_BOX, "run", "-c", config::ROOT_ON])
+    ["on", "default"]
+        .iter()
+        .all(|mode| sudo_ok(&["-l", config::ROOT_XVPN, "root-run", mode]))
+}
+
+// runs as root via the sudoers rule: build the tun config from code, then become sing-box
+pub fn root_run(mode: &str) -> Result<()> {
+    use std::io::Read;
+    use std::os::unix::process::CommandExt;
+    if !config::is_root() {
+        return Err("root-run is started by the supervisor through sudo".into());
+    }
+    let (scope, rules) = match mode {
+        "on" => (config::Scope::Global, Vec::new()),
+        "default" => {
+            let mut raw = String::new();
+            fs::File::open(config::user_default_json())
+                .and_then(|file| file.take(1 << 20).read_to_string(&mut raw))
+                .map_err(|e| format!("reading default.json: {e}"))?;
+            let user = serde_json::from_str(&raw).map_err(|e| format!("default.json: {e}"))?;
+            (
+                config::Scope::Selective,
+                config::sanitized_user_rules(&user),
+            )
+        }
+        _ => return Err(format!("unknown root-run mode '{mode}'")),
+    };
+    let rules = serde_json::json!({ "route": { "rules": rules } });
+    let run = config::migrate_singbox(&rules, scope, Ingress::Tun);
+    let run = serde_json::to_vec_pretty(&run).map_err(|e| format!("rendering run.json: {e}"))?;
+    fs::write(config::ROOT_RUN, run).map_err(|e| format!("{}: {e}", config::ROOT_RUN))?;
+    let error = Command::new(config::ROOT_SING_BOX)
+        .args(["run", "-c", config::ROOT_RUN])
+        .exec();
+    Err(format!("could not start sing-box: {error}"))
 }
 
 fn root_proxy_running() -> bool {
@@ -307,7 +337,7 @@ pub fn authorize_profile_transition(root: &Path, mode: &str) -> Result<()> {
     authorize_transition(root, mode)
 }
 
-fn spawn(program: &str, config_path: &Path, elevate: bool) -> Result<Proxy> {
+fn spawn(program: &str, config_path: &Path, elevate: Option<&str>) -> Result<Proxy> {
     let log_path = config::log_file(program);
     if let Some(parent) = log_path.parent() {
         let _ = fs::create_dir_all(parent);
@@ -331,16 +361,19 @@ fn spawn(program: &str, config_path: &Path, elevate: bool) -> Result<Proxy> {
         .map(|f| Stdio::from(f.try_clone().unwrap()))
         .unwrap_or_else(Stdio::null);
 
-    let mut command = if elevate {
-        let mut c = Command::new("sudo");
-        c.args(["-n", config::ROOT_SING_BOX]);
-        c
-    } else {
-        Command::new(program)
+    let mut command = match elevate {
+        Some(mode) => {
+            let mut c = Command::new("sudo");
+            c.args(["-n", config::ROOT_XVPN, "root-run", mode]);
+            c
+        }
+        None => {
+            let mut c = Command::new(program);
+            c.args(["run", "-c"]).arg(config_path);
+            c
+        }
     };
     let child = command
-        .args(["run", "-c"])
-        .arg(config_path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(stderr)
@@ -350,7 +383,7 @@ fn spawn(program: &str, config_path: &Path, elevate: bool) -> Result<Proxy> {
     Ok(Proxy {
         child,
         started: Instant::now(),
-        elevated: elevate,
+        elevated: elevate.is_some(),
     })
 }
 
@@ -470,7 +503,7 @@ fn start_for(root: &Path, want: Want, running: &mut BTreeMap<&'static str, Proxy
     };
     log(format!("profile: {name}"));
 
-    match spawn("xray", &root.join(config::XRAY), false) {
+    match spawn("xray", &root.join(config::XRAY), None) {
         Ok(p) => {
             running.insert("xray", p);
         }
@@ -509,12 +542,8 @@ fn start_for(root: &Path, want: Want, running: &mut BTreeMap<&'static str, Proxy
         }
         log("tun mode needs root — using the xvpn sudo rule");
     }
-    let config_path = if elevate {
-        PathBuf::from(config::ROOT_ON)
-    } else {
-        root.join(sidecar)
-    };
-    match spawn("sing-box", &config_path, elevate) {
+    let root_mode = elevate.then(|| if want == Want::On { "on" } else { "default" });
+    match spawn("sing-box", &root.join(sidecar), root_mode) {
         Ok(mut p) => {
             if elevate {
                 let ready = (0..50).any(|_| {
