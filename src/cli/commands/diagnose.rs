@@ -6,7 +6,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use crate::cli::commands::agent::command_ok;
-use crate::cli::commands::apps::{add_app, remove_app};
+use crate::cli::commands::apps::add_app;
 use crate::cli::commands::network::{
     IFCONFIG_CHECK_HOST, IPV4_FALLBACK_IFCONFIG_URL, IPV4_FALLBACK_IP_URL, IP_CHECK_HOST,
 };
@@ -610,11 +610,7 @@ fn diagnostic_direct(root: &Path, log: &DiagnosticLog) -> Result<()> {
 
 fn diagnostic_sites(root: &Path, log: &DiagnosticLog) -> Result<()> {
     let direct = direct_ip(root, log)?;
-    let snapshot: Vec<(PathBuf, Option<Vec<u8>>)> = [config::DEFAULT, config::CONF]
-        .iter()
-        .map(|name| root.join(name))
-        .map(|path| (path.clone(), fs::read(&path).ok()))
-        .collect();
+    let snapshot = selective_snapshot(root);
     let result = (|| {
         let sites = network::listed_sites(&root.join(config::DEFAULT))?;
         log.write("COMMAND xvpn use")?;
@@ -647,24 +643,35 @@ fn diagnostic_sites(root: &Path, log: &DiagnosticLog) -> Result<()> {
     if let Err(error) = crate::cli::commands::mode::set_mode(root, Mode::Off) {
         cleanup_errors.push(error);
     }
-    for (path, bytes) in &snapshot {
-        cleanup_log(
-            log,
-            &format!("RESTORE {}", path.display()),
-            &mut cleanup_errors,
-        );
+    restore_snapshot(&snapshot, log, &mut cleanup_errors);
+    match (result, cleanup_errors.is_empty()) {
+        (Err(error), _) => Err(error),
+        (Ok(()), true) => Ok(()),
+        (Ok(()), false) => Err(format!("site cleanup failed: {cleanup_errors:?}")),
+    }
+}
+
+type Snapshot = Vec<(PathBuf, Option<Vec<u8>>)>;
+
+// default-mode tests edit routed apps/sites and register this network; restore both byte-exact
+fn selective_snapshot(root: &Path) -> Snapshot {
+    [config::DEFAULT, config::CONF]
+        .iter()
+        .map(|name| root.join(name))
+        .map(|path| (path.clone(), fs::read(&path).ok()))
+        .collect()
+}
+
+fn restore_snapshot(snapshot: &Snapshot, log: &DiagnosticLog, errors: &mut Vec<String>) {
+    for (path, bytes) in snapshot {
+        cleanup_log(log, &format!("RESTORE {}", path.display()), errors);
         let restored = match bytes {
             Some(bytes) => fs::write(path, bytes),
             None => fs::remove_file(path),
         };
         if let Err(error) = restored {
-            cleanup_errors.push(format!("restoring {}: {error}", path.display()));
+            errors.push(format!("restoring {}: {error}", path.display()));
         }
-    }
-    match (result, cleanup_errors.is_empty()) {
-        (Err(error), _) => Err(error),
-        (Ok(()), true) => Ok(()),
-        (Ok(()), false) => Err(format!("site cleanup failed: {cleanup_errors:?}")),
     }
 }
 
@@ -925,22 +932,26 @@ fn diagnostic_modes(root: &Path, log: &DiagnosticLog) -> Result<()> {
 }
 
 fn diagnostic_firefox(root: &Path, log: &DiagnosticLog) -> Result<()> {
-    log.write("COMMAND xvpn off")?;
-    crate::cli::commands::mode::set_mode(root, Mode::Off)?;
-    let path = root.join(config::DEFAULT);
-    let had_app = network::listed_apps(&path)?
-        .iter()
-        .any(|app| app == "Firefox");
-    let mut added = false;
+    let direct = direct_ip(root, log)?;
+    let snapshot = selective_snapshot(root);
     let result = (|| {
+        log.write("COMMAND xvpn use")?;
+        network::register(root)?;
+        let sites = network::listed_sites(&root.join(config::DEFAULT))?;
+        if sites.iter().any(|site| site == IP_CHECK_HOST) {
+            log.write(&format!("COMMAND xvpn sites remove {IP_CHECK_HOST}"))?;
+            remove_site(root, IP_CHECK_HOST)?;
+        }
         log.write("COMMAND xvpn apps set Firefox")?;
         add_app(root, "Firefox")?;
-        added = true;
         log.write("COMMAND xvpn default")?;
         crate::cli::commands::mode::set_mode(root, Mode::Default)?;
-        log.write("COMMAND open -a Firefox https://ifconfig.me")?;
-        command_ok("open", &["-a", "Firefox", "https://ifconfig.me"])?;
-        println!("Check the IP displayed in Firefox, then press Enter.");
+        let url = format!("https://{IP_CHECK_HOST}");
+        log.write(&format!("COMMAND open -a Firefox {url}"))?;
+        command_ok("open", &["-a", "Firefox", &url])?;
+        println!(
+            "Firefox should show a VPN IP, NOT your direct IP {direct}. Press Enter when checked."
+        );
         let mut input = String::new();
         io::stdin()
             .read_line(&mut input)
@@ -948,20 +959,11 @@ fn diagnostic_firefox(root: &Path, log: &DiagnosticLog) -> Result<()> {
         Ok(())
     })();
     let mut cleanup_errors = Vec::new();
-    if added && !had_app {
-        cleanup_log(log, "COMMAND xvpn apps remove Firefox", &mut cleanup_errors);
-        if let Err(error) = remove_app(root, "Firefox") {
-            cleanup_errors.push(error);
-        }
-    }
-    cleanup_log(log, "COMMAND xvpn default", &mut cleanup_errors);
-    if let Err(error) = crate::cli::commands::mode::set_mode(root, Mode::Default) {
-        cleanup_errors.push(error);
-    }
     cleanup_log(log, "COMMAND xvpn off", &mut cleanup_errors);
     if let Err(error) = crate::cli::commands::mode::set_mode(root, Mode::Off) {
         cleanup_errors.push(error);
     }
+    restore_snapshot(&snapshot, log, &mut cleanup_errors);
     match (result, cleanup_errors.is_empty()) {
         (Err(error), _) => Err(error),
         (Ok(()), true) => Ok(()),

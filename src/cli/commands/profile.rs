@@ -29,7 +29,7 @@ pub fn use_profile(root: &Path, index: u16) -> Result<()> {
         })?;
     let target_mode = mode_after_profile_selection(&mode);
     if target_mode.as_str() == mode {
-        supervisor::authorize_profile_transition(root, target_mode.as_str())?;
+        supervisor::authorize_transition(root, target_mode.as_str())?;
     }
     profile::activate(root, &name)?;
     out::status("✓", &format!("active profile: {name}"));

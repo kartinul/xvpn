@@ -324,17 +324,7 @@ pub fn authorize_transition(root: &Path, mode: &str) -> Result<()> {
                 .into(),
         );
     }
-    if mode == "off" && sidecar_needs_root() && root_proxy_running() && !stop_root_proxy() {
-        return Err("root-owned sing-box did not stop".into());
-    }
     Ok(())
-}
-
-pub fn authorize_profile_transition(root: &Path, mode: &str) -> Result<()> {
-    if root_proxy_running() {
-        authorize_transition(root, "off")?;
-    }
-    authorize_transition(root, mode)
 }
 
 fn spawn(program: &str, config_path: &Path, elevate: Option<&str>) -> Result<Proxy> {
