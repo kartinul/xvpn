@@ -8,7 +8,7 @@
 
 ## Add a test
 
-1. Add one entry to `DIAGNOSTIC_TESTS` in `src/cli/handlers.rs`.
+1. Add one entry to `DIAGNOSTIC_TESTS` in `src/cli/commands/diagnose.rs`.
 2. Give it a stable kebab-case name, a short checkbox label, and a safe
    default.
 3. Add the name to `run_diagnostic_test`.

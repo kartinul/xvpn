@@ -21,7 +21,7 @@ pub fn set_mode(root: &Path, mode: Mode) -> Result<()> {
 
     if !supervisor::is_running() {
         out::warn("no supervisor is running, so nothing was applied");
-        out::info("start one with `make agent` (auto-start) or `xvpn supervise`");
+        out::info("start it with `xvpn agent restart` (or `xvpn agent install` the first time)");
         return Ok(());
     }
 
