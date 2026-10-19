@@ -87,6 +87,9 @@ pub fn profile(root: &Path, cmd: ProfileCmd) -> Result<()> {
             let name = profile::resolve(root, &name)?;
             profile::remove(root, &name)?;
             out::status("✓", &format!("removed profile '{name}'"));
+            if let Some(active) = profile::active_name(root) {
+                out::kv("active", &active);
+            }
             Ok(())
         }
         ProfileCmd::Show { name } => {
