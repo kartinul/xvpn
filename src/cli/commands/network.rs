@@ -65,7 +65,8 @@ fn run_curl(proxy: &str) -> Result<String> {
     }
 }
 
-pub(crate) const PROBES: [(&str, u16); 2] = [("socks5", config::SOCKS_PORT), ("http", config::HTTP_PORT)];
+pub(crate) const PROBES: [(&str, u16); 2] =
+    [("socks5", config::SOCKS_PORT), ("http", config::HTTP_PORT)];
 pub(crate) const IP_CHECK_HOST: &str = "ip.me";
 pub(crate) const IFCONFIG_CHECK_HOST: &str = "ifconfig.me";
 

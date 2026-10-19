@@ -1,5 +1,3 @@
-
-
 use crate::cli::commands::agent::agent;
 use crate::cli::commands::apps::{add_app, apps, remove_app};
 use crate::cli::commands::diagnose::diagnose;
@@ -7,7 +5,7 @@ use crate::cli::commands::logs::logs;
 use crate::cli::commands::mode::{set_mode, status};
 use crate::cli::commands::network::{check_vpn, use_network};
 use crate::cli::commands::profile::{profile, use_profile};
-use crate::cli::commands::repair::{reset, repair};
+use crate::cli::commands::repair::{repair, reset};
 use crate::cli::commands::sites::sites;
 use crate::cli::commands::utils::run_app;
 use crate::Result;

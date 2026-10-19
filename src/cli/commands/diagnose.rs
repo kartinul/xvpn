@@ -5,13 +5,15 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use crate::cli::Mode;
 use crate::cli::commands::agent::command_ok;
 use crate::cli::commands::apps::{add_app, remove_app};
-use crate::cli::commands::network::{IP_CHECK_HOST, IFCONFIG_CHECK_HOST, IPV4_FALLBACK_IFCONFIG_URL, IPV4_FALLBACK_IP_URL};
+use crate::cli::commands::network::{
+    IFCONFIG_CHECK_HOST, IPV4_FALLBACK_IFCONFIG_URL, IPV4_FALLBACK_IP_URL, IP_CHECK_HOST,
+};
 use crate::cli::commands::profile::use_profile;
 use crate::cli::commands::sites::{add_site, remove_site};
 use crate::cli::commands::utils::run_app;
+use crate::cli::Mode;
 use crate::platform::network;
 use crate::utils::output as out;
 use crate::vpn::config::{self};
@@ -53,7 +55,8 @@ const DIAGNOSTIC_TESTS: [(&str, &str, &str, bool); 6] = [
         "xvpn apps set Firefox",
         "Firefox app routing",
         false,
-    )];
+    ),
+];
 
 const DIAGNOSTIC_DISPLAY_WIDTH: usize = 78;
 
@@ -804,10 +807,7 @@ fn diagnostic_profile_preflight(root: &Path, log: &DiagnosticLog, yes: bool) -> 
     io::stdin()
         .read_line(&mut answer)
         .map_err(|e| format!("reading preflight confirmation: {e}"))?;
-    if matches!(
-        answer.trim().to_ascii_lowercase().as_str(),
-        "n" | "no"
-    ) {
+    if matches!(answer.trim().to_ascii_lowercase().as_str(), "n" | "no") {
         return Err("diagnostic cancelled during profile preflight".into());
     }
     println!();

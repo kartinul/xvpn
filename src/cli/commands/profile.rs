@@ -1,9 +1,9 @@
 use std::io::{self, Write};
 use std::path::Path;
 
-use crate::cli::{Mode, ProfileCmd};
 use crate::cli::commands::mode::{read_mode, set_mode};
 use crate::cli::commands::utils::refresh_sidecars;
+use crate::cli::{Mode, ProfileCmd};
 use crate::utils::output as out;
 use crate::utils::read_json;
 use crate::vpn::profile;

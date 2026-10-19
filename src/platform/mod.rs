@@ -1,3 +1,3 @@
 pub mod network;
 
-pub use network::{router, dns_servers, os, os_name, register, supports_gateway, Networks, Os};
+pub use network::{dns_servers, os, os_name, register, router, supports_gateway, Networks, Os};

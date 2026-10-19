@@ -15,6 +15,9 @@ pub const CONF: &str = "xvpn.conf";
 pub const PROFILES: &str = "profiles";
 pub const ACTIVE: &str = "active";
 pub const ORDER: &str = "order";
+// root-owned copies so nothing the user can edit ever runs as root
+pub const ROOT_SING_BOX: &str = "/usr/local/libexec/xvpn/sing-box";
+pub const ROOT_ON: &str = "/usr/local/libexec/xvpn/on.json";
 
 fn config_home() -> PathBuf {
     if let Some(dir) = env_var("XDG_CONFIG_HOME") {

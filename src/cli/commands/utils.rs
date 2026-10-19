@@ -94,7 +94,12 @@ pub fn refresh_sidecars(root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn ensure_sidecar(root: &Path, name: &str, scope: config::Scope, ingress: config::Ingress) -> Result<()> {
+fn ensure_sidecar(
+    root: &Path,
+    name: &str,
+    scope: config::Scope,
+    ingress: config::Ingress,
+) -> Result<()> {
     let path = root.join(name);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("{name}: {e}"))?;

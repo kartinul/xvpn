@@ -228,7 +228,9 @@ pub fn dispatch(cli: Cli) {
         Some(Command::Logs) => commands::logs::logs(),
         Some(Command::Repair) => commands::repair::repair(&root),
         Some(Command::Reset) => commands::repair::reset(&root),
-        Some(Command::Diagnose { test, yes }) => commands::diagnose::diagnose(&root, test.as_deref(), yes),
+        Some(Command::Diagnose { test, yes }) => {
+            commands::diagnose::diagnose(&root, test.as_deref(), yes)
+        }
         Some(Command::Agent { cmd }) => {
             let cmd = cmd.unwrap_or(AgentCmd::Install);
             commands::agent::agent(cmd, &root)

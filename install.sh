@@ -95,12 +95,12 @@ installed on $OS, as the current user (no root daemon).
   xvpn set default             selective routing (per app)
   xvpn apps set Telegram       route one app
   xvpn sites set netflix.com   route one site (and its subdomains)
-  xvpn on                      route ALL traffic (needs sudo -v on macOS)
+  xvpn on                      route ALL traffic
   xvpn                         current mode + what goes via xray
   xvpn logs                    tail the supervisor and proxy logs
   xvpn --help                  everything else
 
-Full-system routing in 'on' mode needs root for sing-box's tun interface. xvpn
-will ask for sudo authorization only when a tun transition needs it; the
-background supervisor then reuses that cached grant instead of prompting.
+Full-system routing in 'on' mode needs root for sing-box's tun interface.
+On macOS, `xvpn agent install` asks for sudo once and installs a root-owned
+sing-box copy plus a narrow rule in /etc/sudoers.d/xvpn.
 EOF
