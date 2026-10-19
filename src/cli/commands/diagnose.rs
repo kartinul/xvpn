@@ -744,15 +744,19 @@ fn diagnostic_profile_preflight(root: &Path, log: &DiagnosticLog, yes: bool) -> 
             format!("profile {index}")
         };
         log.write(&format!(
-            "PREFLIGHT xvpn {index} curl -4 --retry 3 {IFCONFIG_CHECK_HOST}"
+            "PREFLIGHT xvpn {index} curl -4 --max-time 15 --retry 3 --retry-max-time 40 {IFCONFIG_CHECK_HOST}"
         ))?;
         let output = Command::new(&executable)
             .args([
                 index.to_string(),
                 "curl".into(),
                 "-4".into(),
+                "--max-time".into(),
+                "15".into(),
                 "--retry".into(),
                 "3".into(),
+                "--retry-max-time".into(),
+                "40".into(),
                 "--retry-all-errors".into(),
                 IFCONFIG_CHECK_HOST.into(),
             ])
@@ -766,15 +770,19 @@ fn diagnostic_profile_preflight(root: &Path, log: &DiagnosticLog, yes: bool) -> 
             ))?;
             let fallback = ipv4_fallback_url(IFCONFIG_CHECK_HOST);
             log.write(&format!(
-                "PREFLIGHT xvpn {index} curl -4 --retry 3 {fallback} (IPv4 fallback)"
+                "PREFLIGHT xvpn {index} curl -4 --max-time 15 --retry 3 --retry-max-time 40 {fallback} (IPv4 fallback)"
             ))?;
             let fallback_output = Command::new(&executable)
                 .args([
                     index.to_string(),
                     "curl".into(),
                     "-4".into(),
+                    "--max-time".into(),
+                    "15".into(),
                     "--retry".into(),
                     "3".into(),
+                    "--retry-max-time".into(),
+                    "40".into(),
                     "--retry-all-errors".into(),
                     fallback.into(),
                 ])
@@ -862,11 +870,13 @@ fn diagnostic_profile_commands(root: &Path, log: &DiagnosticLog) -> Result<()> {
             continue;
         }
         for host in [IP_CHECK_HOST, IFCONFIG_CHECK_HOST] {
-            log.write(&format!("COMMAND xvpn {index} curl -4 {host}"))?;
+            log.write(&format!(
+                "COMMAND xvpn {index} curl -4 --max-time 15 {host}"
+            ))?;
             if let Err(error) = run_app(
                 root,
                 index as u16,
-                &[String::from("curl"), String::from("-4"), host.into()],
+                &["curl", "-4", "--max-time", "15", host].map(String::from),
                 false,
             ) {
                 failures.push(format!("profile {index} {host}: {error}"));
@@ -966,10 +976,23 @@ fn check_curls(log: &DiagnosticLog) -> Result<(String, String)> {
 }
 
 fn diagnose_curl(log: &DiagnosticLog, host: &str) -> Result<String> {
-    let command = format!("curl -4 --retry 3 --retry-all-errors -sS {host}");
+    let command = format!(
+        "curl -4 --max-time 15 --retry 3 --retry-max-time 40 --retry-all-errors -sS {host}"
+    );
     log.write(&format!("COMMAND {command}"))?;
     let output = Command::new("curl")
-        .args(["-4", "--retry", "3", "--retry-all-errors", "-sS", host])
+        .args([
+            "-4",
+            "--max-time",
+            "15",
+            "--retry",
+            "3",
+            "--retry-max-time",
+            "40",
+            "--retry-all-errors",
+            "-sS",
+            host,
+        ])
         .output()
         .map_err(|e| format!("{command}: {e}"))?;
     let stdout = compact_diagnostic_output(&String::from_utf8_lossy(&output.stdout));
@@ -1004,10 +1027,23 @@ fn diagnose_curl(log: &DiagnosticLog, host: &str) -> Result<String> {
 
 fn fallback_ipv4(log: &DiagnosticLog, host: &str) -> Result<String> {
     let fallback = ipv4_fallback_url(host);
-    let command = format!("curl -4 --retry 3 --retry-all-errors -sS {fallback}");
+    let command = format!(
+        "curl -4 --max-time 15 --retry 3 --retry-max-time 40 --retry-all-errors -sS {fallback}"
+    );
     log.write(&format!("COMMAND {command} (IPv4 fallback for {host})"))?;
     let output = Command::new("curl")
-        .args(["-4", "--retry", "3", "--retry-all-errors", "-sS", fallback])
+        .args([
+            "-4",
+            "--max-time",
+            "15",
+            "--retry",
+            "3",
+            "--retry-max-time",
+            "40",
+            "--retry-all-errors",
+            "-sS",
+            fallback,
+        ])
         .output()
         .map_err(|e| format!("{command}: {e}"))?;
     let stdout = compact_diagnostic_output(&String::from_utf8_lossy(&output.stdout));
