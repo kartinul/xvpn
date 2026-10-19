@@ -609,27 +609,50 @@ fn diagnostic_direct(root: &Path, log: &DiagnosticLog) -> Result<()> {
 }
 
 fn diagnostic_sites(root: &Path, log: &DiagnosticLog) -> Result<()> {
-    log.write("COMMAND xvpn off")?;
-    crate::cli::commands::mode::set_mode(root, Mode::Off)?;
+    let direct = direct_ip(root, log)?;
     let path = root.join(config::DEFAULT);
-    let had_site = network::listed_sites(&path)?
-        .iter()
-        .any(|site| site == IP_CHECK_HOST);
-    let mut added = false;
+    let sites = network::listed_sites(&path)?;
+    let had_ip_me = sites.iter().any(|site| site == IP_CHECK_HOST);
+    let had_ifconfig = sites.iter().any(|site| site == IFCONFIG_CHECK_HOST);
+    let conf = root.join(config::CONF);
+    let conf_before = fs::read(&conf).ok();
     let result = (|| {
-        log.write(&format!("COMMAND xvpn sites set {IP_CHECK_HOST}"))?;
-        add_site(root, IP_CHECK_HOST)?;
-        added = true;
+        log.write("COMMAND xvpn use")?;
+        network::register(root)?;
+        if had_ifconfig {
+            log.write(&format!("COMMAND xvpn sites remove {IFCONFIG_CHECK_HOST}"))?;
+            remove_site(root, IFCONFIG_CHECK_HOST)?;
+        }
+        if !had_ip_me {
+            log.write(&format!("COMMAND xvpn sites set {IP_CHECK_HOST}"))?;
+            add_site(root, IP_CHECK_HOST)?;
+        }
         log.write("COMMAND xvpn default")?;
         crate::cli::commands::mode::set_mode(root, Mode::Default)?;
         let (ip_me, ifconfig) = check_curls(log)?;
-        if ip_me == ifconfig {
-            return Err("site routing returned the same public IP for both hosts".into());
+        if ip_me == direct {
+            return Err(format!(
+                "{IP_CHECK_HOST} went direct ({ip_me}), expected the VPN"
+            ));
+        }
+        if ifconfig != direct {
+            return Err(format!(
+                "{IFCONFIG_CHECK_HOST} went via {ifconfig}, expected direct {direct}"
+            ));
         }
         Ok(())
     })();
     let mut cleanup_errors = Vec::new();
-    if added && !had_site {
+    cleanup_log(log, "COMMAND xvpn off", &mut cleanup_errors);
+    if let Err(error) = crate::cli::commands::mode::set_mode(root, Mode::Off) {
+        cleanup_errors.push(error);
+    }
+    if !had_ip_me
+        && network::listed_sites(&path)
+            .unwrap_or_default()
+            .iter()
+            .any(|s| s == IP_CHECK_HOST)
+    {
         cleanup_log(
             log,
             &format!("COMMAND xvpn sites remove {IP_CHECK_HOST}"),
@@ -639,21 +662,40 @@ fn diagnostic_sites(root: &Path, log: &DiagnosticLog) -> Result<()> {
             cleanup_errors.push(error);
         }
     }
-    cleanup_log(log, "COMMAND xvpn default", &mut cleanup_errors);
-    if let Err(error) = crate::cli::commands::mode::set_mode(root, Mode::Default) {
-        cleanup_errors.push(error);
-    } else if let Err(error) = check_curls(log).map(|_| ()) {
-        cleanup_errors.push(error);
+    if had_ifconfig
+        && !network::listed_sites(&path)
+            .unwrap_or_default()
+            .iter()
+            .any(|s| s == IFCONFIG_CHECK_HOST)
+    {
+        cleanup_log(
+            log,
+            &format!("COMMAND xvpn sites set {IFCONFIG_CHECK_HOST}"),
+            &mut cleanup_errors,
+        );
+        if let Err(error) = add_site(root, IFCONFIG_CHECK_HOST) {
+            cleanup_errors.push(error);
+        }
     }
-    cleanup_log(log, "COMMAND xvpn off", &mut cleanup_errors);
-    if let Err(error) = crate::cli::commands::mode::set_mode(root, Mode::Off) {
-        cleanup_errors.push(error);
+    cleanup_log(log, "RESTORE xvpn.conf", &mut cleanup_errors);
+    let restored = match &conf_before {
+        Some(bytes) => fs::write(&conf, bytes),
+        None => fs::remove_file(&conf),
+    };
+    if let Err(error) = restored {
+        cleanup_errors.push(format!("restoring {}: {error}", conf.display()));
     }
     match (result, cleanup_errors.is_empty()) {
         (Err(error), _) => Err(error),
         (Ok(()), true) => Ok(()),
         (Ok(()), false) => Err(format!("site cleanup failed: {cleanup_errors:?}")),
     }
+}
+
+fn direct_ip(root: &Path, log: &DiagnosticLog) -> Result<String> {
+    log.write("COMMAND xvpn off")?;
+    crate::cli::commands::mode::set_mode(root, Mode::Off)?;
+    diagnose_curl(log, IP_CHECK_HOST)
 }
 
 fn cleanup_log(log: &DiagnosticLog, message: &str, errors: &mut Vec<String>) {
@@ -867,6 +909,7 @@ fn diagnostic_profile_commands(root: &Path, log: &DiagnosticLog) -> Result<()> {
 }
 
 fn diagnostic_modes(root: &Path, log: &DiagnosticLog) -> Result<()> {
+    let direct = direct_ip(root, log)?;
     for (name, mode) in [
         ("off", Mode::Off),
         ("default", Mode::Default),
@@ -874,7 +917,21 @@ fn diagnostic_modes(root: &Path, log: &DiagnosticLog) -> Result<()> {
     ] {
         log.write(&format!("COMMAND xvpn {name}"))?;
         crate::cli::commands::mode::set_mode(root, mode)?;
-        check_curls(log)?;
+        let (ip_me, ifconfig) = check_curls(log)?;
+        let routed = [&ip_me, &ifconfig].map(|ip| *ip != direct);
+        match name {
+            "off" if routed.contains(&true) => {
+                return Err(format!(
+                    "off still routes: {ip_me} / {ifconfig}, direct {direct}"
+                ))
+            }
+            "on" if routed.contains(&false) => {
+                return Err(format!(
+                    "on leaks direct: {ip_me} / {ifconfig}, direct {direct}"
+                ))
+            }
+            _ => {}
+        }
         log.write("COMMAND xvpn off")?;
         crate::cli::commands::mode::set_mode(root, Mode::Off)?;
     }
