@@ -610,20 +610,20 @@ fn diagnostic_direct(root: &Path, log: &DiagnosticLog) -> Result<()> {
 
 fn diagnostic_sites(root: &Path, log: &DiagnosticLog) -> Result<()> {
     let direct = direct_ip(root, log)?;
-    let path = root.join(config::DEFAULT);
-    let sites = network::listed_sites(&path)?;
-    let had_ip_me = sites.iter().any(|site| site == IP_CHECK_HOST);
-    let had_ifconfig = sites.iter().any(|site| site == IFCONFIG_CHECK_HOST);
-    let conf = root.join(config::CONF);
-    let conf_before = fs::read(&conf).ok();
+    let snapshot: Vec<(PathBuf, Option<Vec<u8>>)> = [config::DEFAULT, config::CONF]
+        .iter()
+        .map(|name| root.join(name))
+        .map(|path| (path.clone(), fs::read(&path).ok()))
+        .collect();
     let result = (|| {
+        let sites = network::listed_sites(&root.join(config::DEFAULT))?;
         log.write("COMMAND xvpn use")?;
         network::register(root)?;
-        if had_ifconfig {
+        if sites.iter().any(|site| site == IFCONFIG_CHECK_HOST) {
             log.write(&format!("COMMAND xvpn sites remove {IFCONFIG_CHECK_HOST}"))?;
             remove_site(root, IFCONFIG_CHECK_HOST)?;
         }
-        if !had_ip_me {
+        if !sites.iter().any(|site| site == IP_CHECK_HOST) {
             log.write(&format!("COMMAND xvpn sites set {IP_CHECK_HOST}"))?;
             add_site(root, IP_CHECK_HOST)?;
         }
@@ -647,43 +647,19 @@ fn diagnostic_sites(root: &Path, log: &DiagnosticLog) -> Result<()> {
     if let Err(error) = crate::cli::commands::mode::set_mode(root, Mode::Off) {
         cleanup_errors.push(error);
     }
-    if !had_ip_me
-        && network::listed_sites(&path)
-            .unwrap_or_default()
-            .iter()
-            .any(|s| s == IP_CHECK_HOST)
-    {
+    for (path, bytes) in &snapshot {
         cleanup_log(
             log,
-            &format!("COMMAND xvpn sites remove {IP_CHECK_HOST}"),
+            &format!("RESTORE {}", path.display()),
             &mut cleanup_errors,
         );
-        if let Err(error) = remove_site(root, IP_CHECK_HOST) {
-            cleanup_errors.push(error);
+        let restored = match bytes {
+            Some(bytes) => fs::write(path, bytes),
+            None => fs::remove_file(path),
+        };
+        if let Err(error) = restored {
+            cleanup_errors.push(format!("restoring {}: {error}", path.display()));
         }
-    }
-    if had_ifconfig
-        && !network::listed_sites(&path)
-            .unwrap_or_default()
-            .iter()
-            .any(|s| s == IFCONFIG_CHECK_HOST)
-    {
-        cleanup_log(
-            log,
-            &format!("COMMAND xvpn sites set {IFCONFIG_CHECK_HOST}"),
-            &mut cleanup_errors,
-        );
-        if let Err(error) = add_site(root, IFCONFIG_CHECK_HOST) {
-            cleanup_errors.push(error);
-        }
-    }
-    cleanup_log(log, "RESTORE xvpn.conf", &mut cleanup_errors);
-    let restored = match &conf_before {
-        Some(bytes) => fs::write(&conf, bytes),
-        None => fs::remove_file(&conf),
-    };
-    if let Err(error) = restored {
-        cleanup_errors.push(format!("restoring {}: {error}", conf.display()));
     }
     match (result, cleanup_errors.is_empty()) {
         (Err(error), _) => Err(error),
