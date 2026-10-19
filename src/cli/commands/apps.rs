@@ -34,11 +34,29 @@ pub fn remove_app(root: &Path, app: &str) -> Result<()> {
 
 fn edit_app(root: &Path, add: bool, app: &str) -> Result<()> {
     let shown = network::normalize_app(app)?;
+    if add && network::os() == network::Os::MacOs && !app_installed(&shown) {
+        out::warn(&format!(
+            "{shown}.app is not in any Applications folder; the rule matches nothing until it is"
+        ));
+    }
     announce_edit(
         network::edit_app(&root.join(config::DEFAULT), add, &shown),
         add,
         &shown,
     )
+}
+
+fn app_installed(name: &str) -> bool {
+    let home = config::home_dir().join("Applications");
+    [
+        Path::new("/Applications"),
+        Path::new("/Applications/Utilities"),
+        Path::new("/System/Applications"),
+        Path::new("/System/Applications/Utilities"),
+        home.as_path(),
+    ]
+    .iter()
+    .any(|dir| dir.join(format!("{name}.app")).exists())
 }
 
 fn announce_edit(result: Result<()>, add: bool, name: &str) -> Result<()> {
