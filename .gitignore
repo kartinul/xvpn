@@ -1,0 +1,11 @@
+target/
+bin/
+xray.json
+profiles/
+active
+modes/
+xvpn.conf
+mode
+order
+*.json.tmp
+todo.md
