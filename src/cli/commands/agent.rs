@@ -110,6 +110,7 @@ Restart=always\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n",
                 binary.display()
             );
             fs::write(&unit, content).map_err(|e| format!("writing systemd unit: {e}"))?;
+            install_root_setup(binary)?;
             command_ok("systemctl", &["--user", "daemon-reload"])?;
             command_ok("systemctl", &["--user", "enable", "--now", "xvpn.service"])?;
         }
@@ -130,7 +131,7 @@ fn sudoers_rule(user: &str) -> String {
 
 fn sudo_install(source: &str, target: &str) -> Result<()> {
     let args = [
-        "install", "-m", "755", "-o", "root", "-g", "wheel", source, target,
+        "install", "-m", "755", "-o", "root", "-g", "0", source, target,
     ];
     command_ok("sudo", &args)
 }
@@ -179,9 +180,7 @@ fn install_root_setup(binary: &Path) -> Result<()> {
     let dir = config::ROOT_DIR;
     command_ok(
         "sudo",
-        &[
-            "install", "-d", "-m", "755", "-o", "root", "-g", "wheel", dir,
-        ],
+        &["install", "-d", "-m", "755", "-o", "root", "-g", "0", dir],
     )?;
     sudo_install(&sing_box, config::ROOT_SING_BOX)?;
     sudo_install(&binary.display().to_string(), config::ROOT_XVPN)?;
@@ -235,7 +234,10 @@ fn restart_agent(binary: &Path) -> Result<()> {
             launchctl(&["bootstrap".into(), domain, plist.display().to_string()])
         }
         network::Os::Linux => {
-            install_agent(binary)?;
+            let unit = config::home_dir().join(".config/systemd/user/xvpn.service");
+            if !unit.is_file() {
+                install_agent(binary)?;
+            }
             command_ok("systemctl", &["--user", "restart", "xvpn.service"])
         }
     }

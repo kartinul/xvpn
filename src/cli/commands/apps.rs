@@ -1,5 +1,7 @@
+use std::fs;
 use std::path::Path;
 
+use crate::cli::commands::utils::network_config;
 use crate::cli::AppsAction;
 use crate::platform::network;
 use crate::utils::output as out;
@@ -11,15 +13,20 @@ pub fn apps(root: &Path, action: AppsAction, app: Option<String>) -> Result<()> 
     let (action, app) = validate_apps_args(action, app)?;
     match (action, app) {
         (AppsAction::Show, _) => list_apps(root),
-        (AppsAction::Set, Some(app)) => add_app(root, &app),
+        (AppsAction::Add, Some(app)) => add_app(root, &app),
         (AppsAction::Remove, Some(app)) => remove_app(root, &app),
         _ => Err("invalid apps arguments".into()),
     }
 }
 
 pub fn list_apps(root: &Path) -> Result<()> {
-    let apps = network::listed_apps(&root.join(config::DEFAULT))?;
-    out::section("apps:");
+    let path = network::network_rules(root)?;
+    let apps = if path.is_file() {
+        network::listed_apps(&path)?
+    } else {
+        Vec::new()
+    };
+    out::section(&format!("apps on network {}:", network::network_id()?));
     out::list(&apps.iter().map(|s| s.as_str()).collect::<Vec<_>>());
     Ok(())
 }
@@ -33,30 +40,44 @@ pub fn remove_app(root: &Path, app: &str) -> Result<()> {
 }
 
 fn edit_app(root: &Path, add: bool, app: &str) -> Result<()> {
-    let shown = network::normalize_app(app)?;
-    if add && network::os() == network::Os::MacOs && !app_installed(&shown) {
-        out::warn(&format!(
-            "{shown}.app is not in any Applications folder; the rule matches nothing until it is"
-        ));
+    let mut shown = network::normalize_app(app)?;
+    if add && network::os() == network::Os::MacOs {
+        match installed_name(&shown) {
+            Some(name) => shown = name,
+            None => out::warn(&format!(
+                "{shown}.app is not in any Applications folder; the rule matches nothing until it is"
+            )),
+        }
     }
     announce_edit(
-        network::edit_app(&root.join(config::DEFAULT), add, &shown),
+        network::edit_app(&network_config(root)?, add, &shown),
         add,
         &shown,
     )
 }
 
-fn app_installed(name: &str) -> bool {
+// rules match paths case-sensitively but the disk doesn't, so use the name as it is on disk
+fn installed_name(name: &str) -> Option<String> {
     let home = config::home_dir().join("Applications");
-    [
+    let files = [
         Path::new("/Applications"),
         Path::new("/Applications/Utilities"),
         Path::new("/System/Applications"),
         Path::new("/System/Applications/Utilities"),
         home.as_path(),
     ]
-    .iter()
-    .any(|dir| dir.join(format!("{name}.app")).exists())
+    .into_iter()
+    .flat_map(|dir| fs::read_dir(dir).into_iter().flatten().flatten())
+    .filter_map(|entry| entry.file_name().into_string().ok());
+    match_app(files, name)
+}
+
+fn match_app(files: impl Iterator<Item = String>, name: &str) -> Option<String> {
+    let bundle = format!("{name}.app");
+    files
+        .filter(|file| file.eq_ignore_ascii_case(&bundle))
+        .map(|file| file[..name.len()].to_string())
+        .next()
 }
 
 fn announce_edit(result: Result<()>, add: bool, name: &str) -> Result<()> {
@@ -73,5 +94,17 @@ fn announce_edit(result: Result<()>, add: bool, name: &str) -> Result<()> {
             Ok(())
         }
         Err(e) => Err(e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn app_name_takes_the_casing_on_disk() {
+        let files = || ["Notes.app", "WhatsApp.app"].map(String::from).into_iter();
+        assert_eq!(match_app(files(), "whatsapp").as_deref(), Some("WhatsApp"));
+        assert_eq!(match_app(files(), "What"), None);
     }
 }

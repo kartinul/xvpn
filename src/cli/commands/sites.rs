@@ -1,25 +1,33 @@
 use std::path::Path;
 
+use crate::cli::commands::utils::network_config;
 use crate::cli::SitesAction;
 use crate::platform::network;
 use crate::utils::output as out;
 use crate::utils::validate_sites_args;
-use crate::vpn::config::{self};
 use crate::Result;
 
 pub fn sites(root: &Path, action: SitesAction, site: Option<String>) -> Result<()> {
     let (action, site) = validate_sites_args(action, site)?;
     match (action, site) {
         (SitesAction::Show, _) => list_sites(root),
-        (SitesAction::Set, Some(site)) => add_site(root, &site),
+        (SitesAction::Add, Some(site)) => add_site(root, &site),
         (SitesAction::Remove, Some(site)) => remove_site(root, &site),
         _ => Err("invalid sites arguments".into()),
     }
 }
 
 pub fn list_sites(root: &Path) -> Result<()> {
-    let sites = network::listed_sites(&root.join(config::DEFAULT))?;
-    out::section("sites (and subdomains):");
+    let path = network::network_rules(root)?;
+    let sites = if path.is_file() {
+        network::listed_sites(&path)?
+    } else {
+        Vec::new()
+    };
+    out::section(&format!(
+        "sites (and subdomains) on network {}:",
+        network::network_id()?
+    ));
     out::list(&sites.iter().map(|s| s.as_str()).collect::<Vec<_>>());
     Ok(())
 }
@@ -35,7 +43,7 @@ pub fn remove_site(root: &Path, site: &str) -> Result<()> {
 fn edit_site(root: &Path, add: bool, site: &str) -> Result<()> {
     let shown = network::normalize_site(site)?;
     announce_edit(
-        network::edit_site(&root.join(config::DEFAULT), add, &shown),
+        network::edit_site(&network_config(root)?, add, &shown),
         add,
         &shown,
     )

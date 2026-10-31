@@ -12,7 +12,7 @@ use crate::cli::commands::network::{
 };
 use crate::cli::commands::profile::use_profile;
 use crate::cli::commands::sites::{add_site, remove_site};
-use crate::cli::commands::utils::run_app;
+use crate::cli::commands::utils::{network_config, run_app};
 use crate::cli::Mode;
 use crate::platform::network;
 use crate::utils::output as out;
@@ -36,7 +36,7 @@ use ratatui::{
 
 const DIAGNOSTIC_TESTS: [(&str, &str, &str, bool); 6] = [
     ("direct", "xvpn off", "direct connection", true),
-    ("sites", "xvpn sites set ip.me", "site routing", false),
+    ("sites", "xvpn sites add ip.me", "site routing", false),
     ("profiles", "xvpn <index>", "every profile", true),
     (
         "profile-commands",
@@ -52,7 +52,7 @@ const DIAGNOSTIC_TESTS: [(&str, &str, &str, bool); 6] = [
     ),
     (
         "firefox",
-        "xvpn apps set Firefox",
+        "xvpn apps add Firefox",
         "Firefox app routing",
         false,
     ),
@@ -610,17 +610,15 @@ fn diagnostic_direct(root: &Path, log: &DiagnosticLog) -> Result<()> {
 
 fn diagnostic_sites(root: &Path, log: &DiagnosticLog) -> Result<()> {
     let direct = direct_ip(root, log)?;
-    let snapshot = selective_snapshot(root);
+    let snapshot = selective_snapshot(root)?;
     let result = (|| {
-        let sites = network::listed_sites(&root.join(config::DEFAULT))?;
-        log.write("COMMAND xvpn use")?;
-        network::register(root)?;
+        let sites = network::listed_sites(&network_config(root)?)?;
         if sites.iter().any(|site| site == IFCONFIG_CHECK_HOST) {
             log.write(&format!("COMMAND xvpn sites remove {IFCONFIG_CHECK_HOST}"))?;
             remove_site(root, IFCONFIG_CHECK_HOST)?;
         }
         if !sites.iter().any(|site| site == IP_CHECK_HOST) {
-            log.write(&format!("COMMAND xvpn sites set {IP_CHECK_HOST}"))?;
+            log.write(&format!("COMMAND xvpn sites add {IP_CHECK_HOST}"))?;
             add_site(root, IP_CHECK_HOST)?;
         }
         log.write("COMMAND xvpn default")?;
@@ -653,13 +651,12 @@ fn diagnostic_sites(root: &Path, log: &DiagnosticLog) -> Result<()> {
 
 type Snapshot = Vec<(PathBuf, Option<Vec<u8>>)>;
 
-// default-mode tests edit routed apps/sites and register this network; restore both byte-exact
-fn selective_snapshot(root: &Path) -> Snapshot {
-    [config::DEFAULT, config::CONF]
-        .iter()
-        .map(|name| root.join(name))
+// default-mode tests edit this network's routed apps/sites; restore them byte-exact
+fn selective_snapshot(root: &Path) -> Result<Snapshot> {
+    Ok([root.join(config::DEFAULT), network::network_rules(root)?]
+        .into_iter()
         .map(|path| (path.clone(), fs::read(&path).ok()))
-        .collect()
+        .collect())
 }
 
 fn restore_snapshot(snapshot: &Snapshot, log: &DiagnosticLog, errors: &mut Vec<String>) {
@@ -933,16 +930,14 @@ fn diagnostic_modes(root: &Path, log: &DiagnosticLog) -> Result<()> {
 
 fn diagnostic_firefox(root: &Path, log: &DiagnosticLog) -> Result<()> {
     let direct = direct_ip(root, log)?;
-    let snapshot = selective_snapshot(root);
+    let snapshot = selective_snapshot(root)?;
     let result = (|| {
-        log.write("COMMAND xvpn use")?;
-        network::register(root)?;
-        let sites = network::listed_sites(&root.join(config::DEFAULT))?;
+        let sites = network::listed_sites(&network_config(root)?)?;
         if sites.iter().any(|site| site == IP_CHECK_HOST) {
             log.write(&format!("COMMAND xvpn sites remove {IP_CHECK_HOST}"))?;
             remove_site(root, IP_CHECK_HOST)?;
         }
-        log.write("COMMAND xvpn apps set Firefox")?;
+        log.write("COMMAND xvpn apps add Firefox")?;
         add_app(root, "Firefox")?;
         log.write("COMMAND xvpn default")?;
         crate::cli::commands::mode::set_mode(root, Mode::Default)?;

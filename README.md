@@ -16,7 +16,7 @@ The released `xvpn` binary:
 - manages profiles, selective apps/sites, and `on`/`default`/`off` modes;
 - runs the supervisor directly with `xvpn supervise`;
 - installs the per-user supervisor agent with `xvpn agent install`;
-- installs a narrow, root-owned sudo setup for macOS TUN routing.
+- installs a narrow, root-owned sudo setup for TUN routing.
 
 No `make` command is required at runtime. `install.sh` is only a convenience
 installer for building from source, installing third-party dependencies, and
@@ -75,11 +75,14 @@ xvpn off           # stop routing
 xvpn 1             # select profile 1; enables full routing if currently off
 ```
 
-Configure selective routing:
+Configure selective routing for the network you are on (identified by its DNS
+server's /24). `default` mode only routes on networks that have rules; on any
+other network everything goes direct:
 
 ```sh
-xvpn apps set Telegram
-xvpn sites set netflix.com
+xvpn apps add Telegram
+xvpn sites add netflix.com
+xvpn sites            # this network's list
 ```
 
 Inspect state and logs:
@@ -151,9 +154,8 @@ check and does not use curl.
 
 ## Privilege behavior
 
-xray and Linux gateway/TProxy routing run as the current user. macOS TUN
-routing needs root for sing-box. A LaunchAgent has no terminal, so it cannot
-reuse a terminal's sudo ticket. `xvpn agent install` (asks for sudo once) sets up:
+xray runs as the current user. TUN routing needs root for sing-box. A LaunchAgent
+or systemd user unit has no terminal, so it cannot reuse a terminal's sudo ticket. `xvpn agent install` (asks for sudo once) sets up:
 
 - `/usr/local/libexec/xvpn/{xvpn,sing-box}` — root-owned copies of both binaries;
 - `/etc/sudoers.d/xvpn` — NOPASSWD only for `xvpn root-run on|default` and

@@ -2,8 +2,7 @@ use std::fs;
 use std::io::{self};
 use std::path::Path;
 
-use crate::cli::commands::utils::{ensure_dependencies, ingress, refresh_sidecars, sidecars};
-use crate::platform::network;
+use crate::cli::commands::utils::{ensure_dependencies, refresh_sidecars, sidecars};
 use crate::utils::output as out;
 use crate::utils::write_json;
 use crate::vpn::config::{self};
@@ -43,7 +42,7 @@ pub fn reset(root: &Path) -> Result<()> {
     }
 
     out::section("removing configs:");
-    for name in [config::XRAY, config::CONF, config::ACTIVE, config::ORDER] {
+    for name in [config::XRAY, config::ACTIVE, config::ORDER] {
         match fs::remove_file(root.join(name)) {
             Ok(()) => out::status("✓", &format!("deleted {name}")),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -52,19 +51,20 @@ pub fn reset(root: &Path) -> Result<()> {
             Err(e) => out::status("✗", &format!("could not delete {name}: {e}")),
         }
     }
-    if config::profiles_dir(root).is_dir() {
-        match fs::remove_dir_all(config::profiles_dir(root)) {
-            Ok(()) => out::status("✓", &format!("deleted {}", config::PROFILES)),
-            Err(e) => out::status("✗", &format!("could not delete {}: {e}", config::PROFILES)),
+    for dir in [config::PROFILES, config::NETWORKS] {
+        if root.join(dir).is_dir() {
+            match fs::remove_dir_all(root.join(dir)) {
+                Ok(()) => out::status("✓", &format!("deleted {dir}")),
+                Err(e) => out::status("✗", &format!("could not delete {dir}: {e}")),
+            }
         }
     }
 
-    let ingress = ingress();
     let mut failures: Vec<Error> = Vec::new();
     out::section("recreating configs:");
     for (name, scope) in sidecars() {
         let path = root.join(name);
-        if let Err(e) = write_json(&path, &config::singbox_config(scope, ingress)) {
+        if let Err(e) = write_json(&path, &config::singbox_config(scope)) {
             failures.push(format!("{name}: {e}"));
             continue;
         }
@@ -74,14 +74,9 @@ pub fn reset(root: &Path) -> Result<()> {
         }
     }
 
-    for (name, content) in [
-        (config::CONF, network::CONF_DEFAULT),
-        (config::MODE, "default\n"),
-    ] {
-        match fs::write(root.join(name), content) {
-            Ok(()) => out::status("✓", &format!("reset {name}")),
-            Err(e) => failures.push(format!("{name}: {e}")),
-        }
+    match fs::write(root.join(config::MODE), "default\n") {
+        Ok(()) => out::status("✓", &format!("reset {}", config::MODE)),
+        Err(e) => failures.push(format!("{}: {e}", config::MODE)),
     }
 
     if !failures.is_empty() {

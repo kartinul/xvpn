@@ -101,14 +101,12 @@ pub fn read_mode(root: &Path) -> String {
 }
 
 fn print_routing(root: &Path) {
-    let path = root.join(config::DEFAULT);
-    let cfg = match read_json(&path) {
-        Ok(c) => c,
-        Err(_) => {
-            out::kv("routed", "unknown (run `xvpn repair`)");
-            return;
-        }
+    let (Ok(id), Ok(path)) = (network::network_id(), network::network_rules(root)) else {
+        out::kv("network", "unknown (no DNS server), nothing routed");
+        return;
     };
+    out::kv("network", &id);
+    let cfg = read_json(&path).unwrap_or_default();
     let apps = network::app_names(&cfg);
     let sites = network::site_names(&cfg);
 
@@ -121,7 +119,10 @@ fn print_routing(root: &Path) {
         out::list(&sites.iter().map(|s| s.as_str()).collect::<Vec<_>>());
     }
     if apps.is_empty() && sites.is_empty() {
-        out::status("→", "nothing else routed, everything goes direct");
+        out::status(
+            "→",
+            "nothing routed on this network, everything goes direct",
+        );
     } else {
         out::status("→", "everything else direct");
     }

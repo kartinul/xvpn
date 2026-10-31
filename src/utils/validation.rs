@@ -11,12 +11,12 @@ pub fn validate_apps_args(
             "`apps {}` needs an app name (e.g. `xvpn apps {} Telegram`)",
             match action {
                 AppsAction::Show => "show",
-                AppsAction::Set => "set",
+                AppsAction::Add => "add",
                 AppsAction::Remove => "remove",
             },
             match action {
                 AppsAction::Show => "show",
-                AppsAction::Set => "set",
+                AppsAction::Add => "add",
                 AppsAction::Remove => "remove",
             }
         )),
@@ -35,12 +35,12 @@ pub fn validate_sites_args(
             "`sites {}` needs a domain (e.g. `xvpn sites {} netflix.com`)",
             match action {
                 SitesAction::Show => "show",
-                SitesAction::Set => "set",
+                SitesAction::Add => "add",
                 SitesAction::Remove => "remove",
             },
             match action {
                 SitesAction::Show => "show",
-                SitesAction::Set => "set",
+                SitesAction::Add => "add",
                 SitesAction::Remove => "remove",
             }
         )),

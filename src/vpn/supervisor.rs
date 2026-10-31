@@ -8,7 +8,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::platform::network;
-use crate::vpn::config::{self, Ingress};
+use crate::utils::{read_json, write_json};
+use crate::vpn::config;
 use crate::vpn::profile;
 use crate::Result;
 
@@ -98,7 +99,7 @@ pub fn plan(root: &Path) -> Plan {
         Want::On
     } else if mode == "off" {
         Want::None
-    } else if network::read_networks(root).matches(&network::dns_servers()) {
+    } else if sync_network_rules(root) {
         Want::Selective
     } else {
         Want::None
@@ -118,12 +119,18 @@ pub fn plan(root: &Path) -> Plan {
     Plan { want, key }
 }
 
-fn ingress() -> Ingress {
-    if network::supports_gateway() {
-        Ingress::TProxy
-    } else {
-        Ingress::Tun
-    }
+// copies this network's rules into default.json (which root-run reads); false when it has none
+fn sync_network_rules(root: &Path) -> bool {
+    let Some(rules) = network::network_rules(root)
+        .ok()
+        .and_then(|path| read_json(&path).ok())
+        .filter(|cfg| !config::sanitized_user_rules(cfg).is_empty())
+    else {
+        return false;
+    };
+    let fresh = config::migrate_singbox(&rules, config::Scope::Selective);
+    let target = root.join(config::DEFAULT);
+    read_json(&target).ok().as_ref() == Some(&fresh) || write_json(&target, &fresh).is_ok()
 }
 
 fn mtime(path: &Path) -> u64 {
@@ -219,15 +226,14 @@ pub fn is_running() -> bool {
 }
 
 fn sidecar_needs_root() -> bool {
-    ingress() == Ingress::Tun && !config::is_root()
+    !config::is_root()
 }
 
 fn mode_needs_root(root: &Path, mode: &str) -> bool {
-    if config::is_root() || ingress() != Ingress::Tun {
+    if config::is_root() {
         return false;
     }
-    mode == "on"
-        || (mode == "default" && network::read_networks(root).matches(&network::dns_servers()))
+    mode == "on" || (mode == "default" && sync_network_rules(root))
 }
 
 // anchored so it never matches the `sudo ...` wrappers around sing-box or pkill
@@ -276,7 +282,21 @@ pub fn root_run(mode: &str) -> Result<()> {
         _ => return Err(format!("unknown root-run mode '{mode}'")),
     };
     let rules = serde_json::json!({ "route": { "rules": rules } });
-    let run = config::migrate_singbox(&rules, scope, Ingress::Tun);
+    let mut run = config::migrate_singbox(&rules, scope);
+    // systemd-resolved's lookups get hijacked into the tun, so xray couldn't find its own server
+    if network::os() == network::Os::Linux {
+        if let Some(host) = read_json(&config::root().join(config::XRAY))
+            .ok()
+            .as_ref()
+            .and_then(config::server_of)
+        {
+            run["dns"]["servers"]
+                .as_array_mut()
+                .ok_or("run.json has no dns servers")?
+                .push(serde_json::json!({ "tag": "bootstrap", "type": "dhcp" }));
+            run["dns"]["rules"] = serde_json::json!([{ "domain": [host], "server": "bootstrap" }]);
+        }
+    }
     let run = serde_json::to_vec_pretty(&run).map_err(|e| format!("rendering run.json: {e}"))?;
     fs::write(config::ROOT_RUN, run).map_err(|e| format!("{}: {e}", config::ROOT_RUN))?;
     let error = Command::new(config::ROOT_SING_BOX)
@@ -297,10 +317,15 @@ fn root_proxy_running() -> bool {
 
 // the process exists before its routes do; report ready only once traffic goes via the tun
 fn tun_routed() -> bool {
-    Command::new("route")
-        .args(["-n", "get", "1.1.1.1"])
+    let (program, args, marker) = match network::os() {
+        network::Os::MacOs => ("route", ["-n", "get"], "interface: utun"),
+        network::Os::Linux => ("ip", ["route", "get"], "dev tun"),
+    };
+    Command::new(program)
+        .args(args)
+        .arg("1.1.1.1")
         .output()
-        .map(|output| String::from_utf8_lossy(&output.stdout).contains("interface: utun"))
+        .map(|output| String::from_utf8_lossy(&output.stdout).contains(marker))
         .unwrap_or(false)
 }
 

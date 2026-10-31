@@ -101,6 +101,6 @@ installed on $OS, as the current user (no root daemon).
   xvpn --help                  everything else
 
 Full-system routing in 'on' mode needs root for sing-box's tun interface.
-On macOS, `xvpn agent install` asks for sudo once and installs a root-owned
+`xvpn agent install` asks for sudo once and installs a root-owned
 sing-box copy plus a narrow rule in /etc/sudoers.d/xvpn.
 EOF

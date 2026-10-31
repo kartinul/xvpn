@@ -34,26 +34,23 @@ pub enum Command {
         #[arg(value_enum)]
         mode: Mode,
     },
-    /// Manage the apps routed in default mode
+    /// Manage the apps routed in default mode on this network
     Apps {
         #[arg(value_enum, default_value_t = AppsAction::Show)]
         action: AppsAction,
-        /// App bundle name, required for set and remove
+        /// App bundle name, required for add and remove
         app: Option<String>,
     },
-    /// Manage the sites routed in default mode
+    /// Manage the sites routed in default mode on this network
     Sites {
         #[arg(value_enum, default_value_t = SitesAction::Show)]
         action: SitesAction,
-        /// Domain, required for set and remove. Covers subdomains too.
+        /// Domain, required for add and remove. Covers subdomains too.
         site: Option<String>,
     },
     /// Manage named VPN profiles
     #[command(subcommand)]
     Profile(ProfileCmd),
-
-    /// Use selective routing on the network you are on now
-    Use,
 
     /// Alias for `set on`
     #[command(hide = true)]
@@ -67,12 +64,6 @@ pub enum Command {
     /// Alias for bare `xvpn`
     #[command(hide = true)]
     Status,
-    /// Alias for `apps set`
-    #[command(hide = true)]
-    Add { app: String },
-    /// Alias for `apps remove`
-    #[command(hide = true)]
-    Remove { app: String },
     /// Run the supervisor in the foreground
     #[command(hide = true)]
     Supervise,
@@ -143,10 +134,10 @@ impl Mode {
 pub enum AppsAction {
     /// List the routed apps
     Show,
-    /// Route an app through the VPN
-    #[value(alias = "add")]
-    Set,
-    /// Stop routing an app
+    /// Route an app through the VPN on this network
+    #[value(alias = "set")]
+    Add,
+    /// Stop routing an app on this network
     #[value(alias = "rm", alias = "delete")]
     Remove,
 }
@@ -155,10 +146,10 @@ pub enum AppsAction {
 pub enum SitesAction {
     /// List the routed sites
     Show,
-    /// Route a domain through the VPN
-    #[value(alias = "add")]
-    Set,
-    /// Stop routing a domain
+    /// Route a domain through the VPN on this network
+    #[value(alias = "set")]
+    Add,
+    /// Stop routing a domain on this network
     #[value(alias = "rm", alias = "delete")]
     Remove,
 }
@@ -222,10 +213,7 @@ pub fn dispatch(cli: Cli) {
         Some(Command::Status) => commands::mode::status(&root),
         Some(Command::Apps { action, app }) => commands::apps::apps(&root, action, app),
         Some(Command::Sites { action, site }) => commands::sites::sites(&root, action, site),
-        Some(Command::Add { app }) => commands::apps::add_app(&root, &app),
-        Some(Command::Remove { app }) => commands::apps::remove_app(&root, &app),
         Some(Command::Profile(cmd)) => commands::profile::profile(&root, cmd),
-        Some(Command::Use) => commands::network::use_network(&root, true, None),
         Some(Command::RootRun { .. }) => unreachable!("handled before root()"),
         Some(Command::Supervise) => {
             commands::help::run(vpn::supervisor::supervise(&root));

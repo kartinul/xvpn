@@ -11,7 +11,7 @@ pub const MODE: &str = "mode";
 pub const XRAY: &str = "xray.json";
 pub const ON: &str = "modes/on.json";
 pub const DEFAULT: &str = "modes/default.json";
-pub const CONF: &str = "xvpn.conf";
+pub const NETWORKS: &str = "modes/networks";
 pub const PROFILES: &str = "profiles";
 pub const ACTIVE: &str = "active";
 pub const ORDER: &str = "order";
@@ -142,7 +142,7 @@ pub fn migrate_state() -> crate::Result<Option<PathBuf>> {
         .ok_or_else(|| "nothing to migrate: no state in any previous location".to_string())?;
 
     fs::create_dir_all(&root).map_err(|e| format!("{}: {e}", root.display()))?;
-    for name in [MODE, XRAY, CONF, ACTIVE, ORDER] {
+    for name in [MODE, XRAY, ACTIVE, ORDER] {
         let src = from.join(name);
         if src.is_file() && !root.join(name).exists() {
             fs::copy(&src, root.join(name)).map_err(|e| format!("{name}: {e}"))?;
@@ -439,7 +439,8 @@ fn url_decode(s: &str) -> String {
 
 pub const SOCKS_PORT: u16 = 10808;
 pub const HTTP_PORT: u16 = 10809;
-pub const TPROXY_PORT: u16 = 12345;
+// benchmark range: 172.16/12 collides with docker bridges
+const TUN_ADDRESS: &str = "198.18.0.1/30";
 
 pub fn xray_config(link: &Link, socks_port: u16, http_port: u16) -> Value {
     let mut user = json!({
@@ -575,13 +576,7 @@ pub enum Scope {
     Selective,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Ingress {
-    Tun,
-    TProxy,
-}
-
-pub fn singbox_config(scope: Scope, ingress: Ingress) -> Value {
+pub fn singbox_config(scope: Scope) -> Value {
     let mut rules = vec![
         json!({ "process_name": ["xray"], "outbound": "direct" }),
         json!({ "action": "sniff" }),
@@ -599,13 +594,10 @@ pub fn singbox_config(scope: Scope, ingress: Ingress) -> Value {
             ],
             "final": "remote",
         },
-        "inbounds": [match ingress {
-            Ingress::Tun => json!({
-                "type": "tun", "address": ["172.19.0.1/30"], "auto_route": true,
-            }),
-            Ingress::TProxy => json!({
-                "type": "tproxy", "listen": "0.0.0.0", "port": TPROXY_PORT,
-            }),
+        "inbounds": [{
+            "type": "tun", "address": [TUN_ADDRESS], "auto_route": true,
+            // the default stack hands TCP to the kernel, where a host firewall like ufw drops it
+            "stack": if cfg!(target_os = "linux") { "gvisor" } else { "mixed" },
         }],
         "outbounds": [
             { "type": "socks", "tag": "xray", "server": "127.0.0.1", "server_port": SOCKS_PORT },
@@ -656,8 +648,8 @@ pub fn sanitized_user_rules(config: &Value) -> Vec<Value> {
         .collect()
 }
 
-pub fn migrate_singbox(existing: &Value, scope: Scope, ingress: Ingress) -> Value {
-    let mut fresh = singbox_config(scope, ingress);
+pub fn migrate_singbox(existing: &Value, scope: Scope) -> Value {
+    let mut fresh = singbox_config(scope);
     let carried: Vec<Value> = existing
         .get("route")
         .and_then(|r| r.get("rules"))

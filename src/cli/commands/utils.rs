@@ -71,14 +71,6 @@ pub fn check(root: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn ingress() -> config::Ingress {
-    if crate::platform::network::supports_gateway() {
-        config::Ingress::TProxy
-    } else {
-        config::Ingress::Tun
-    }
-}
-
 pub fn sidecars() -> [(&'static str, config::Scope); 2] {
     [
         (config::ON, config::Scope::Global),
@@ -86,27 +78,33 @@ pub fn sidecars() -> [(&'static str, config::Scope); 2] {
     ]
 }
 
+// the current network's rules, created empty on first use
+pub fn network_config(root: &Path) -> Result<PathBuf> {
+    let path = crate::platform::network::network_rules(root)?;
+    if !path.is_file() {
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        }
+        write_json(&path, &config::singbox_config(config::Scope::Selective))?;
+    }
+    Ok(path)
+}
+
 pub fn refresh_sidecars(root: &Path) -> Result<()> {
-    let ingress = ingress();
     for (name, scope) in sidecars() {
-        ensure_sidecar(root, name, scope, ingress)?;
+        ensure_sidecar(root, name, scope)?;
     }
     Ok(())
 }
 
-fn ensure_sidecar(
-    root: &Path,
-    name: &str,
-    scope: config::Scope,
-    ingress: config::Ingress,
-) -> Result<()> {
+fn ensure_sidecar(root: &Path, name: &str, scope: config::Scope) -> Result<()> {
     let path = root.join(name);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("{name}: {e}"))?;
     }
     let action = match read_json(&path) {
         Ok(existing) => {
-            let fresh = config::migrate_singbox(&existing, scope, ingress);
+            let fresh = config::migrate_singbox(&existing, scope);
             if fresh == existing {
                 config::check_singbox(&path).map_err(|e| format!("{name}: {e}"))?;
                 out::status("→", &format!("{name}: already current"));
@@ -116,7 +114,7 @@ fn ensure_sidecar(
             "migrated"
         }
         Err(_) => {
-            write_json(&path, &config::singbox_config(scope, ingress))?;
+            write_json(&path, &config::singbox_config(scope))?;
             "created"
         }
     };

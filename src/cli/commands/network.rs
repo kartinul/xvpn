@@ -1,21 +1,10 @@
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use crate::platform::network;
 use crate::utils::output as out;
 use crate::vpn::config::{self};
 use crate::vpn::profile;
 use crate::Result;
-
-pub fn use_network(root: &Path, add: bool, dns: Option<&str>) -> Result<()> {
-    let msg = if add {
-        network::register(root)?
-    } else {
-        network::unregister(root, dns)?
-    };
-    out::status("✓", &msg);
-    Ok(())
-}
 
 pub fn check_vpn(root: &Path) -> Result<()> {
     let (name, _) = profile::resolve_active(root)?;
