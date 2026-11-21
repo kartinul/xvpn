@@ -119,10 +119,16 @@ mod imp {
         wifi_devices().into_iter().next()
     }
 
+    // systemd-resolved points /etc/resolv.conf at its 127.0.0.53 stub; the real upstreams live in its own copy
     pub fn dns_servers(_dev: &str) -> Vec<String> {
-        let Ok(text) = fs::read_to_string("/etc/resolv.conf") else {
-            return Vec::new();
-        };
+        ["/etc/resolv.conf", "/run/systemd/resolve/resolv.conf"]
+            .iter()
+            .map(|path| nameservers(&fs::read_to_string(path).unwrap_or_default()))
+            .find(|servers| !servers.is_empty())
+            .unwrap_or_default()
+    }
+
+    fn nameservers(text: &str) -> Vec<String> {
         text.lines()
             .filter_map(|l| l.trim().strip_prefix("nameserver "))
             .map(str::trim)
